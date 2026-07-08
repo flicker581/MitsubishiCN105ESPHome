@@ -21,7 +21,7 @@ void CN105Climate::setup() {
     this->target_temperature_high = NAN;
     this->fan_mode = climate::CLIMATE_FAN_OFF;
     this->swing_mode = climate::CLIMATE_SWING_OFF;
-    this->initBytePointer();
+    this->parser_.reset();
     this->lastResponseMs = CUSTOM_MILLIS;
 
     // initialize diagnostic stats
@@ -38,8 +38,17 @@ void CN105Climate::setup() {
     //ESP_LOGI(TAG, "debounce_delay is set to %lu", this->debounce_delay_);
     log_info_uint32(TAG, "debounce_delay is set to ", this->debounce_delay_);
 
-    // IMPORTANT: ne pas initier la connexion UART/CN105 dans setup().
-    // On démarre la séquence dans loop() pour éviter de rater les premiers logs OTA.
+    // IMPORTANT: do not initiate the UART/CN105 connection in setup().
+    // We start the sequence in loop() to avoid missing the first OTA logs.
+
+    // Initialize the internal flag based on the static configuration provided by YAML/Python
+    this->supports_dual_setpoint_ = this->traits_.has_feature_flags(climate::CLIMATE_REQUIRES_TWO_POINT_TARGET_TEMPERATURE);
+    ESP_LOGI(TAG, "Dual setpoint support configured: %s", this->supports_dual_setpoint_ ? "YES" : "NO");
+    ESP_LOGI(TAG, "Horizontal vanes configured: %d", this->horizontal_vanes_);
+
+    // Restore a previously-saved HEAT_COOL band (opt-in) before the first settings read,
+    // so checkPowerAndModeSettings() keeps HEAT_COOL instead of falling back to AUTO.
+    this->restore_setpoint_state_();
 }
 
 
@@ -48,12 +57,12 @@ void CN105Climate::setup() {
  * This function is called repeatedly in the main program loop.
  */
 void CN105Climate::loop() {
-    // Bootstrap connexion CN105 (UART + CONNECT) depuis loop()
+    // Bootstrap connection CN105 (UART + CONNECT) from loop()
     this->maybe_start_connection_();
 
-    // Tant que la connexion n'a pas réussi, on ne lance AUCUN cycle/écriture (sinon ça court-circuite le délai).
-    // On continue quand même à lire/processer l'input afin de détecter le 0x7A/0x7B (connection success).
-    const bool can_talk_to_hp = this->isHeatpumpConnected_;
+    // As long as the connection is not successful, we do not launch ANY cycle/write (otherwise it short-circuits the delay).
+    // We still continue to read/process the input in order to detect 0x7A/0x7B (connection success).
+    const bool can_talk_to_hp = this->isHeatpumpConnected();
 
     if (!this->processInput()) {                                            // if we don't get any input: no read op
         if (!can_talk_to_hp) {
@@ -63,11 +72,26 @@ void CN105Climate::loop() {
             this->checkPendingWantedSettings();
         } else if ((this->wantedRunStates.hasChanged) && (!this->loopCycle.isCycleRunning())) {
             this->checkPendingWantedRunStates();
+        } else if ((this->isSetFunctions_) && (!this->loopCycle.isCycleRunning())) {
+            this->isSetFunctions_ = false;
+            this->setFunctions(this->functions);
+            // Also request to get function settings from heat pump to update UI with latest values.
+            this->isGetFunctions_ = true;
         } else {
             if (this->loopCycle.isCycleRunning()) {                         // if we are  running an update cycle
                 this->loopCycle.checkTimeout(this->update_interval_);
             } else { // we are not running a cycle
                 if (this->loopCycle.hasUpdateIntervalPassed(this->get_update_interval())) {
+                    if (this->isGetFunctions_) {
+                        // Reactivate requests 0x20/0x22 and bypass interval timers.
+                        // This must be done before starting a new cycle to prevent a race hazard of
+                        // request 0x22 occurring before request 0x20.
+                        this->scheduler_.enable_request(0x20);
+                        this->scheduler_.timer_bypass(0x20);
+                        this->scheduler_.enable_request(0x22);
+                        this->scheduler_.timer_bypass(0x22);
+                        this->isGetFunctions_ = false;
+                    }
                     this->buildAndSendRequestsInfoPackets();            // initiate an update cycle with this->cycleStarted();
                 }
             }
@@ -76,45 +100,58 @@ void CN105Climate::loop() {
 }
 
 void CN105Climate::maybe_start_connection_() {
-    if (this->conn_bootstrap_started_) return;
-
-    // Timeout global: au bout de 2 minutes on démarre même sans WiFi
-    if (!this->conn_timeout_armed_) {
-        this->conn_timeout_armed_ = true;
-        this->set_timeout("cn105_bootstrap_timeout", 120000, [this]() {
-            if (this->conn_bootstrap_started_) return;
-            ESP_LOGW(LOG_CONN_TAG, "Bootstrap connexion: timeout 120s, démarrage CN105 malgré tout");
-            this->conn_bootstrap_started_ = true;
-            this->setupUART();
-            this->sendFirstConnectionPacket();
+    switch (state_) {
+        case DriverState::BOOT: {
+            // Arm a 120s global timeout (fires once, forces connection even without WiFi)
+            this->set_timeout("cn105_bootstrap_timeout", 120000, [this]() {
+                if (state_ >= DriverState::CONNECTING) return;
+                ESP_LOGW(LOG_CONN_TAG, "Bootstrap connexion: timeout 120s, démarrage CN105 malgré tout");
+                this->setupUART();
+                this->sendFirstConnectionPacket();
             });
-    }
 
 #ifdef USE_WIFI
-    if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_connected()) {
-        if (!this->conn_wait_logged_) {
-            this->conn_wait_logged_ = true;
-            ESP_LOGI(LOG_CONN_TAG, "Bootstrap connexion: attente WiFi avant init UART/CONNECT");
-        }
-        return;
-    }
+            if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_connected()) {
+                this->transition_to_(DriverState::WAIT_WIFI);
+                ESP_LOGI(LOG_CONN_TAG, "Bootstrap connexion: attente WiFi avant init UART/CONNECT");
+                return;
+            }
 #endif
-
-    // Délai de grâce pour laisser le flux de logs OTA se connecter (évite de rater la séquence CONNECT)
-    const uint32_t grace_ms = this->conn_bootstrap_delay_ms_;
-    const uint32_t elapsed = CUSTOM_MILLIS - this->boot_ms_;
-    if (elapsed < grace_ms) {
-        if (!this->conn_grace_logged_) {
-            this->conn_grace_logged_ = true;
-            ESP_LOGI(LOG_CONN_TAG, "Bootstrap connexion: délai de grâce %ums pour logs OTA", grace_ms);
+            // WiFi ready (or no WiFi) — check grace delay
+            this->transition_to_(DriverState::WAIT_GRACE);
+            ESP_LOGI(LOG_CONN_TAG, "Bootstrap connexion: délai de grâce %ums pour logs OTA", this->conn_bootstrap_delay_ms_);
+            return;
         }
-        return;
-    }
 
-    this->conn_bootstrap_started_ = true;
-    ESP_LOGI(LOG_CONN_TAG, "Bootstrap connexion: init UART + envoi CONNECT (loop)");
-    this->setupUART();
-    this->sendFirstConnectionPacket();
+        case DriverState::WAIT_WIFI: {
+#ifdef USE_WIFI
+            if (wifi::global_wifi_component != nullptr && !wifi::global_wifi_component->is_connected()) {
+                return;  // still waiting
+            }
+#endif
+            this->transition_to_(DriverState::WAIT_GRACE);
+            ESP_LOGI(LOG_CONN_TAG, "Bootstrap connexion: WiFi connecté, délai de grâce %ums", this->conn_bootstrap_delay_ms_);
+            return;
+        }
+
+        case DriverState::WAIT_GRACE: {
+            const uint32_t elapsed = CUSTOM_MILLIS - this->boot_ms_;
+            if (elapsed < this->conn_bootstrap_delay_ms_) {
+                return;  // grace delay not elapsed yet
+            }
+            ESP_LOGI(LOG_CONN_TAG, "Bootstrap connexion: init UART + envoi CONNECT (loop)");
+            this->setupUART();
+            this->sendFirstConnectionPacket();
+            // setupUART() transitions to CONNECTING if UART config is valid
+            return;
+        }
+
+        case DriverState::CONNECTING:
+        case DriverState::CONNECTED:
+        case DriverState::DISCONNECTED:
+            // Nothing to do — connection already started or managed elsewhere
+            return;
+    }
 }
 
 uint32_t CN105Climate::get_update_interval() const { return this->update_interval_; }

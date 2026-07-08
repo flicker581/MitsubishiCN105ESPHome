@@ -1,18 +1,15 @@
 #include "cn105.h"
+#include <algorithm>  // for std::max
 
 using namespace esphome;
 
 uint8_t CN105Climate::checkSum(uint8_t bytes[], int len) {
-    uint8_t sum = 0;
-    for (int i = 0; i < len; i++) {
-        sum += bytes[i];
-    }
-    return (0xfc - sum) & 0xff;
+    return cn105_protocol::checksum(bytes, len);
 }
 
 
 void CN105Climate::sendFirstConnectionPacket() {
-    if (this->isUARTConnected_) {
+    if (this->isUARTReady_()) {
         this->lastReconnectTimeMs = CUSTOM_MILLIS;          // marker to prevent to many reconnections
         this->setHeatpumpConnected(false);
         uint8_t packet[CONNECT_LEN];
@@ -36,7 +33,7 @@ void CN105Climate::sendFirstConnectionPacket() {
 
         // we wait for a 10s timeout to check if the hp has replied to connection packet
         this->set_timeout("checkFirstConnection", 10000, [this]() {
-            if (!this->isHeatpumpConnected_) {
+            if (!this->isHeatpumpConnected()) {
                 ESP_LOGE(LOG_CONN_TAG, "--> Heatpump did not reply: NOT CONNECTED <--");
                 // Fallback automatique: si le mode installateur est demandé mais que la PAC ignore 0x5B,
                 // on retente une fois en mode standard (0x5A) pour préserver la connectivité.
@@ -93,7 +90,7 @@ void CN105Climate::prepareSetPacket(uint8_t* packet, int length) {
 
 void CN105Climate::writePacket(uint8_t* packet, int length, bool checkIsActive) {
 
-    if ((this->isUARTConnected_) &&
+    if ((this->isUARTReady_()) &&
         (this->isHeatpumpConnectionActive() || (!checkIsActive))) {
 
         ESP_LOGD(TAG, "writing packet...");
@@ -124,7 +121,7 @@ void CN105Climate::writePacket(uint8_t* packet, int length, bool checkIsActive) 
 
 void CN105Climate::try_write_pending_packet() {
     if (!this->has_pending_packet_) return;
-    if (!this->isUARTConnected_) {
+    if (!this->isUARTReady_()) {
         this->reconnectUART();
         this->set_timeout("write", 2000, [this]() { this->try_write_pending_packet(); });
         return;
@@ -232,7 +229,7 @@ void CN105Climate::createPacket(uint8_t* packet) {
     }
 
     if (wantedSettings.temperature != -1) {
-        if (!tempMode) {
+        if (!use_temperature_encoding_b_) {
             ESP_LOGD(TAG, "temperature (tempmode is false) -> %f", getTemperatureSetting());
             int idx = lookupByteMapIndex(TEMP_MAP, 16, getTemperatureSetting(), "temperature (write)");
             if (idx >= 0) { packet[10] = TEMP[idx]; packet[6] += CONTROL_PACKET_1[2]; } else { ESP_LOGW(TAG, "Ignoring invalid temperature setting while building packet"); }
@@ -259,7 +256,30 @@ void CN105Climate::createPacket(uint8_t* packet) {
     if (this->wantedSettings.wideVane != nullptr) {
         ESP_LOGD(TAG, "heatpump widevane -> %s", getWideVaneSetting());
         int idx = lookupByteMapIndex(WIDEVANE_MAP, 8, getWideVaneSetting(), "wideVane (write)");
-        if (idx >= 0) { packet[18] = WIDEVANE[idx] | (this->wideVaneAdj ? 0x80 : 0x00); packet[7] += CONTROL_PACKET_2[0]; } else { ESP_LOGW(TAG, "Ignoring invalid wideVane setting while building packet"); }
+        if (idx >= 0) {
+            packet[18] = WIDEVANE[idx] | (this->wideVaneAdj ? 0x80 : 0x00);
+            packet[7] += CONTROL_PACKET_2[0];
+
+
+            switch (this->vane_type_) {
+                case VaneType::SPLIT_HORIZONTAL:
+                    // Experimental: Left Horizontal Vane support for dual vane units (Type A)
+                    // Byte 16 is used in IR protocol for Left Vane (which corresponds to Horizontal/Wide Vane on these units)
+                    // Copy the base WIDEVANE value (without adjustment bit) to Byte 16
+                    packet[16] = WIDEVANE[idx];
+                    break;
+                case VaneType::SPLIT_VERTICAL:
+                    // Experimental: Split Vertical Vane support (Type B)
+                    // TODO: Reverse engineering required for Byte 12 or other control bytes.
+                    // For now, logging to help debugging.
+                    ESP_LOGD(TAG, "Split Vertical Vane: WideVane set to %s (Index %d). Packet[12] (Vertical) is %02X", getWideVaneSetting(), idx, packet[12]);
+                    break;
+                case VaneType::STANDARD:
+                default:
+                    // No special handling
+                    break;
+            }
+        } else { ESP_LOGW(TAG, "Ignoring invalid wideVane setting while building packet"); }
     }
 
 
@@ -297,8 +317,11 @@ void CN105Climate::publishWantedSettingsStateToHA() {
         checkVaneSettings(this->wantedSettings, false);
     }
 
-    // HA Temp
-    this->updateTargetTemperaturesFromSettings(this->getTemperatureSetting());
+    // HA Temp — only update if this SET includes an explicit temperature change;
+    // otherwise the stale currentSettings.temperature would overwrite the UI.
+    if (this->wantedSettings.temperature != -1.0f) {
+        this->updateTargetTemperaturesFromSettings(this->getTemperatureSetting());
+    }
 
     // publish to HA
     this->publish_state();
@@ -373,7 +396,7 @@ void CN105Climate::sendWantedSettingsDelegate() {
  *
 */
 void CN105Climate::sendWantedSettings() {
-    if (this->isHeatpumpConnectionActive() && this->isUARTConnected_) {
+    if (this->isHeatpumpConnectionActive() && this->isUARTReady_()) {
         if (CUSTOM_MILLIS - this->lastSend > 300) {        // we don't want to send too many packets
 
             //this->cycleEnded();   // only if we let the cycle be interrupted to send wented settings
@@ -420,7 +443,7 @@ void CN105Climate::buildAndSendInfoPacket(uint8_t code) {
 
 
 void CN105Climate::buildAndSendRequestsInfoPackets() {
-    if (this->isHeatpumpConnected_) {
+    if (this->isHeatpumpConnected()) {
         ESP_LOGV(LOG_UPD_INT_TAG, "triggering infopacket because of update interval tick");
         ESP_LOGV("CONTROL_WANTED_SETTINGS", "hasChanged is %s", wantedSettings.hasChanged ? "true" : "false");
         this->loopCycle.cycleStarted();
@@ -457,9 +480,45 @@ void CN105Climate::createInfoPacket(uint8_t* packet, uint8_t code) {
 }
 
 
-void CN105Climate::sendRemoteTemperature() {
+void CN105Climate::sendRemoteTemperaturePacket() {
+    // Build and send the remote temperature packet (0x07) without affecting watchdog/keep-alive timers
 
-    this->shouldSendExternalTemperature_ = false;
+    // Debounce logic: avoid flooding the bus with identical temperature values
+    // Only skip if: same temperature AND sent recently (within half of keep-alive interval, min 5s)
+    uint32_t now = CUSTOM_MILLIS;
+    uint32_t min_interval = this->remote_temp_keepalive_interval_ms_ > 0
+        ? std::max(this->remote_temp_keepalive_interval_ms_ / 2, (uint32_t)5000)
+        : 5000;  // Default 5s if keep-alive disabled
+
+    bool temp_changed = (this->remoteTemperature_ != this->last_remote_temp_sent_);
+    uint32_t elapsed = now - this->last_remote_temp_send_ms_;
+
+    if (!temp_changed && elapsed < min_interval) {
+        // Debounce: skip this send
+        this->remote_temp_debounce_skip_count_++;
+
+        // Detect conflicting heartbeat pattern: multiple rapid calls with same value
+        // After 3 consecutive skips, warn the user (only once)
+        // Only show warning if keep-alive is enabled - if disabled, manual heartbeat is intentional
+        if (this->remote_temp_debounce_skip_count_ >= 3 &&
+            !this->remote_temp_heartbeat_warning_shown_ &&
+            this->remote_temp_keepalive_interval_ms_ > 0) {
+            this->remote_temp_heartbeat_warning_shown_ = true;
+            ESP_LOGW(LOG_REMOTE_TEMP,
+                "Detected repeated remote temperature calls with unchanged value (%.1f). "
+                "If you have a manual heartbeat/interval in YAML, consider removing it - "
+                "the built-in keep-alive (every %lu ms) handles this automatically. "
+                "See 'remote_temperature_keepalive_interval' option in documentation.",
+                this->remoteTemperature_, (unsigned long)this->remote_temp_keepalive_interval_ms_);
+        }
+
+        ESP_LOGD(LOG_REMOTE_TEMP, "Debounce: skipping remote temp send (same value %.1f, %lu ms since last send, min interval %lu ms, skip #%d)",
+            this->remoteTemperature_, (unsigned long)elapsed, (unsigned long)min_interval, this->remote_temp_debounce_skip_count_);
+        return;
+    }
+
+    // Reset debounce skip counter on successful send
+    this->remote_temp_debounce_skip_count_ = 0;
 
     uint8_t packet[PACKET_LEN] = {};
 
@@ -477,11 +536,21 @@ void CN105Climate::sendRemoteTemperature() {
     // add the checksum
     uint8_t chkSum = checkSum(packet, 21);
     packet[21] = chkSum;
-    ESP_LOGD(LOG_REMOTE_TEMP, "Sending remote temperature packet... -> %f", this->remoteTemperature_);
+
+    ESP_LOGD(LOG_REMOTE_TEMP, "Sending remote temperature packet... -> %.1f%s",
+        this->remoteTemperature_, temp_changed ? " (changed)" : " (keep-alive)");
     writePacket(packet, PACKET_LEN);
 
-    // this resets the timeout
-    this->pingExternalTemperature();
+    // Update debounce tracking
+    this->last_remote_temp_send_ms_ = now;
+    this->last_remote_temp_sent_ = this->remoteTemperature_;
+}
+
+void CN105Climate::sendRemoteTemperature() {
+    this->shouldSendExternalTemperature_ = false;
+
+    // Send the packet
+    this->sendRemoteTemperaturePacket();
 }
 
 void CN105Climate::sendWantedRunStates() {

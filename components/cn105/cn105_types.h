@@ -8,22 +8,26 @@
 #define MAX_DELAY_RESPONSE_FACTOR 10  
 
 static const char* LOG_ACTION_EVT_TAG = "EVT_SETS";
-static const char* TAG = "CN105"; 
-static const char* LOG_REMOTE_TEMP = "REMOTE_TEMP"; 
-static const char* LOG_ACK = "ACK"; 
-static const char* LOG_SETTINGS_TAG = "SETTINGS";   
-static const char* LOG_STATUS_TAG = "STATUS";       
-static const char* LOG_CYCLE_TAG = "CYCLE";         
-static const char* LOG_UPD_INT_TAG = "UPDT_ITVL";   
+static const char* TAG = "CN105";
+static const char* LOG_REMOTE_TEMP = "REMOTE_TEMP";
+static const char* LOG_ACK = "ACK";
+static const char* LOG_SETTINGS_TAG = "SETTINGS";
+static const char* LOG_STATUS_TAG = "STATUS";
+static const char* LOG_CYCLE_TAG = "CYCLE";
+static const char* LOG_UPD_INT_TAG = "UPDT_ITVL";
 static const char* LOG_SET_RUN_STATE = "SET_RUN_STATE";
-static const char* LOG_OPERATING_STATUS_TAG = "OPERATING_STATUS"; 
-static const char* LOG_TEMP_SENSOR_TAG = "TEMP_SENSOR"; 
-static const char* LOG_DUAL_SP_TAG = "DUAL_SP"; 
-static const char* LOG_FUNCTIONS_TAG = "FUNCTIONS"; 
+static const char* LOG_OPERATING_STATUS_TAG = "OPERATING_STATUS";
+static const char* LOG_TEMP_SENSOR_TAG = "TEMP_SENSOR";
+static const char* LOG_DUAL_SP_TAG = "DUAL_SP";
+static const char* LOG_FUNCTIONS_TAG = "FUNCTIONS";
 static const char* LOG_HARDWARE_SELECT_TAG = "HardwareSelect";
 static const char* LOG_CONN_TAG = "CN105_CONN";
 
 static const char* SHEDULER_REMOTE_TEMP_TIMEOUT = "->remote_temp_timeout";
+static const char* SCHEDULER_REMOTE_TEMP_KEEPALIVE = "->remote_temp_keepalive";
+
+// Default interval for remote temperature keep-alive (20 seconds, as observed on Kumo)
+static const uint32_t DEFAULT_REMOTE_TEMP_KEEPALIVE_INTERVAL_MS = 20000;
 
 static const int DEFER_SCHEDULE_UPDATE_LOOP_DELAY = 750;
 static const uint32_t RECEIVED_SETPOINT_GRACE_WINDOW_MS = 3000;
@@ -89,10 +93,35 @@ static const char* AIRFLOW_CONTROL_MAP[3] = { "EVEN", "INDIRECT", "DIRECT" };
 static const uint8_t STAGE[7] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
 static const char* STAGE_MAP[7] = { "IDLE", "LOW", "GENTLE", "MEDIUM", "MODERATE", "HIGH", "DIFFUSE" };
 
-static const uint8_t SUB_MODE[4] = { 0x00, 0x02, 0x04, 0x08 };
-static const char* SUB_MODE_MAP[4] = { "NORMAL", "DEFROST", "PREHEAT", "STANDBY" };
-static const uint8_t AUTO_SUB_MODE[4] = { 0x00, 0x01, 0x02, 0x03 };
-static const char* AUTO_SUB_MODE_MAP[4] = { "AUTO_OFF","AUTO_COOL", "AUTO_HEAT", "AUTO_LEADER" };
+// 0x10 = OFF state, observed on MFZ-KX09NL / MFZ-KJ18NA when the unit is
+// powered off (data[3] of the 0x09 packet). Confirmed by correlation with
+// 0x02 data[3] (power) = 0x00 across every powered-off cycle.
+static const uint8_t SUB_MODE[6] = { 0x00, 0x01, 0x02, 0x04, 0x08, 0x10 };
+static const char* SUB_MODE_MAP[6] = { "NORMAL", "WARMUP", "DEFROST", "PREHEAT", "STANDBY", "OFF" };
+
+// 0x40 / 0x41 / 0x43 added for newer MFZ units, where data[5] of the 0x09
+// packet is a bitfield rather than the older 0x00..0x03 enum:
+//   bit 0 (0x01) is set when AUTO climate mode is selected
+//   bit 1 (0x02) is set once the compressor has engaged in this AUTO
+//                session (i.e. the unit has identified the room needs
+//                active heating or cooling and acted on it). Sticky:
+//                stays set after the compressor cycles back off.
+//   bit 6 (0x40) is constantly set (purpose unknown, observed in every state
+//                including OFF, HEAT, COOL, DRY, FAN, AUTO across many cycles)
+//   bits 2..5  : unprobed
+// Observed states:
+//   0x40 AUTO_INACTIVE — AUTO mode not selected
+//   0x41 AUTO_IDLE     — AUTO selected, compressor not engaged
+//                        (e.g. room already at setpoint, no action needed)
+//   0x43 AUTO_ACTIVE   — AUTO selected, compressor has engaged at least
+//                        once in this session (sticky)
+// Note that 0x43 does NOT distinguish current cool-vs-heat direction; on these
+// units that has to be inferred from setpoint vs room temperature in 0x02.
+// These labels are distinct from the older AUTO_COOL/AUTO_HEAT/AUTO_LEADER
+// labels which appear to belong to a different protocol revision (older units
+// where this byte was a 4-state enum rather than a bitfield).
+static const uint8_t AUTO_SUB_MODE[7] = { 0x00, 0x01, 0x02, 0x03, 0x40, 0x41, 0x43 };
+static const char* AUTO_SUB_MODE_MAP[7] = { "AUTO_OFF", "AUTO_COOL", "AUTO_HEAT", "AUTO_LEADER", "AUTO_INACTIVE", "AUTO_IDLE", "AUTO_ACTIVE" };
 
 static const int TIMER_INCREMENT_MINUTES = 10;
 
@@ -106,19 +135,19 @@ const uint8_t ESPMHP_MAX_TEMPERATURE = 26;
 const float ESPMHP_TEMPERATURE_STEP = 0.5;
 
 struct heatpumpSettings {
-    const char* power;
-    const char* mode;
-    float temperature;
-    float dual_low_target;
-    float dual_high_target;
-    const char* fan;
-    const char* vane;
-    const char* wideVane;
-    bool iSee;
-    bool connected;
-    const char* stage;
-    const char* sub_mode;
-    const char* auto_sub_mode;
+    const char* power = nullptr;
+    const char* mode = nullptr;
+    float temperature = -1.0f;
+    float dual_low_target = -100.0f;
+    float dual_high_target = -100.0f;
+    const char* fan = nullptr;
+    const char* vane = nullptr;
+    const char* wideVane = nullptr;
+    bool iSee = false;
+    bool connected = false;
+    const char* stage = nullptr;
+    const char* sub_mode = nullptr;
+    const char* auto_sub_mode = nullptr;
 
     void resetSettings() {
         power = nullptr;
@@ -131,24 +160,8 @@ struct heatpumpSettings {
         wideVane = nullptr;
     }
 
-    heatpumpSettings& operator=(const heatpumpSettings& other) {
-        if (this != &other) {
-            power = other.power;
-            mode = other.mode;
-            temperature = other.temperature;
-            dual_low_target = other.dual_low_target;
-            dual_high_target = other.dual_high_target;
-            fan = other.fan;
-            vane = other.vane;
-            wideVane = other.wideVane;
-            iSee = other.iSee;
-            connected = other.connected;
-            stage = other.stage;
-            sub_mode = other.sub_mode;
-            auto_sub_mode = other.auto_sub_mode;
-        }
-        return *this;
-    }
+    // Trivial copy — all members are scalars/pointers
+    heatpumpSettings& operator=(const heatpumpSettings& other) = default;
 
     bool operator==(const heatpumpSettings& other) const {
         return power == other.power &&
@@ -159,16 +172,16 @@ struct heatpumpSettings {
             wideVane == other.wideVane;
     }
 
-    bool operator!=(const heatpumpSettings& other) {
+    bool operator!=(const heatpumpSettings& other) const {
         return !(this->operator==(other));
     }
 };
 
 struct wantedHeatpumpSettings : heatpumpSettings {
-    bool hasChanged;
-    bool hasBeenSent;
-    uint8_t nb_deffered_requests;
-    long lastChange;
+    bool hasChanged = false;
+    bool hasBeenSent = false;
+    uint8_t nb_deffered_requests = 0;
+    long lastChange = 0;
 
     void resetSettings() {
         heatpumpSettings::resetSettings();
@@ -176,14 +189,8 @@ struct wantedHeatpumpSettings : heatpumpSettings {
         hasBeenSent = false;
     }
 
-    wantedHeatpumpSettings& operator=(const wantedHeatpumpSettings& other) {
-        if (this != &other) {
-            heatpumpSettings::operator=(other);
-            hasChanged = other.hasChanged;
-            hasBeenSent = other.hasBeenSent;
-        }
-        return *this;
-    }
+    // Trivial copy — all members are scalars
+    wantedHeatpumpSettings& operator=(const wantedHeatpumpSettings& other) = default;
 
     wantedHeatpumpSettings& operator=(const heatpumpSettings& other) {
         if (this != &other) {
@@ -194,22 +201,15 @@ struct wantedHeatpumpSettings : heatpumpSettings {
 };
 
 struct heatpumpTimers {
-    const char* mode;
-    int onMinutesSet;
-    int onMinutesRemaining;
-    int offMinutesSet;
-    int offMinutesRemaining;
+    const char* mode = nullptr;
+    int onMinutesSet = 0;
+    int onMinutesRemaining = 0;
+    int offMinutesSet = 0;
+    int offMinutesRemaining = 0;
 
-    heatpumpTimers& operator=(const heatpumpTimers& other) {
-        if (this != &other) {
-            mode = other.mode;
-            onMinutesSet = other.onMinutesSet;
-            onMinutesRemaining = other.onMinutesRemaining;
-            offMinutesSet = other.offMinutesSet;
-            offMinutesRemaining = other.offMinutesRemaining;
-        }
-        return *this;
-    }
+    // Trivial copy — all members are scalars/pointers
+    heatpumpTimers& operator=(const heatpumpTimers& other) = default;
+
     bool operator==(const heatpumpTimers& other) const {
         return
             mode == other.mode &&
@@ -224,14 +224,14 @@ struct heatpumpTimers {
 };
 
 struct heatpumpStatus {
-    float roomTemperature;
-    float outsideAirTemperature;
-    bool operating;
-    heatpumpTimers timers;
-    float compressorFrequency;
-    float inputPower;
-    float kWh;
-    float runtimeHours;
+    float roomTemperature = NAN;
+    float outsideAirTemperature = NAN;
+    bool operating = false;
+    heatpumpTimers timers{};
+    float compressorFrequency = NAN;
+    float inputPower = NAN;
+    float kWh = NAN;
+    float runtimeHours = NAN;
 
     bool operator==(const heatpumpStatus& other) const {
         return (std::isnan(roomTemperature) ? std::isnan(other.roomTemperature) : roomTemperature == other.roomTemperature) &&
@@ -249,10 +249,10 @@ struct heatpumpStatus {
 };
 
 struct heatpumpRunStates {
-    int8_t air_purifier;
-    int8_t night_mode;
-    int8_t circulator;
-    const char* airflow_control;
+    int8_t air_purifier = -1;
+    int8_t night_mode = -1;
+    int8_t circulator = -1;
+    const char* airflow_control = nullptr;
 
     void resetSettings() {
         air_purifier = -1;
@@ -261,15 +261,8 @@ struct heatpumpRunStates {
         airflow_control = nullptr;
     }
 
-    heatpumpRunStates& operator=(const heatpumpRunStates& other) {
-        if (this != &other) {
-            air_purifier = other.air_purifier;
-            night_mode = other.night_mode;
-            circulator = other.circulator;
-            airflow_control = other.airflow_control;
-        }
-        return *this;
-    }
+    // Trivial copy — all members are scalars/pointers
+    heatpumpRunStates& operator=(const heatpumpRunStates& other) = default;
 
     bool operator==(const heatpumpRunStates& other) const {
         return air_purifier == other.air_purifier &&
@@ -278,15 +271,15 @@ struct heatpumpRunStates {
             airflow_control == other.airflow_control;
     }
 
-    bool operator!=(const heatpumpRunStates& other) {
+    bool operator!=(const heatpumpRunStates& other) const {
         return !(this->operator==(other));
     }
 };
 
 struct wantedHeatpumpRunStates : heatpumpRunStates {
-    bool hasChanged;
-    bool hasBeenSent;
-    long lastChange;
+    bool hasChanged = false;
+    bool hasBeenSent = false;
+    long lastChange = 0;
 
     void resetSettings() {
         heatpumpRunStates::resetSettings();
@@ -294,14 +287,8 @@ struct wantedHeatpumpRunStates : heatpumpRunStates {
         hasBeenSent = false;
     }
 
-    wantedHeatpumpRunStates& operator=(const wantedHeatpumpRunStates& other) {
-        if (this != &other) {
-            heatpumpRunStates::operator=(other);
-            hasChanged = other.hasChanged;
-            hasBeenSent = other.hasBeenSent;
-        }
-        return *this;
-    }
+    // Trivial copy — all members are scalars
+    wantedHeatpumpRunStates& operator=(const wantedHeatpumpRunStates& other) = default;
 
     wantedHeatpumpRunStates& operator=(const heatpumpRunStates& other) {
         if (this != &other) {

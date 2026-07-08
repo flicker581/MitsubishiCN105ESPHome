@@ -1,10 +1,13 @@
 #pragma once
 #include "Globals.h"
+#include "cn105_protocol.h"
+#include "frame_parser.h"
 #include "esphome/components/uart/uart.h"
 #include "heatpumpFunctions.h"
 #include "van_orientation_select.h"
 #include "uptime_connection_sensor.h"
 #include "compressor_frequency_sensor.h"
+#include "target_humidity_sensor.h"
 #include "input_power_sensor.h"
 #include "kwh_sensor.h"
 #include "runtime_hours_sensor.h"
@@ -16,6 +19,8 @@
 #include "functions_number.h"
 #include "functions_button.h"
 #include "sub_mode_sensor.h"
+#include "error_code_sensor.h"
+#include "remote_temp_source_info.h"
 #include "hvac_option_switch.h"
 #include "hardware_setting_select.h"
 #include "localization.h"
@@ -24,6 +29,7 @@
 #include <esphome/components/sensor/sensor.h>
 #include <esphome/components/button/button.h>
 #include <esphome/components/binary_sensor/binary_sensor.h>
+#include "esphome/core/preferences.h"
 #include "cycle_management.h"
 #include <vector>
 #include <map>
@@ -33,6 +39,18 @@
 #endif
 
 namespace esphome {
+
+    // Connection lifecycle FSM — replaces 6 scattered booleans
+    enum class DriverState : uint8_t {
+        BOOT,           // setup() done, loop() not yet called
+        WAIT_WIFI,      // WiFi required but not yet connected
+        WAIT_GRACE,     // WiFi OK, OTA grace delay in progress
+        CONNECTING,     // UART configured, CONNECT sent, awaiting 0x7A/0x7B
+        CONNECTED,      // Handshake succeeded, ready to poll
+        DISCONNECTED,   // Response timeout, reconnection needed
+    };
+
+    const char* driver_state_to_str(DriverState s);
 
     void log_info_uint32(const char* tag, const char* msg, uint32_t value, const char* suffix = "");
     void log_debug_uint32(const char* tag, const char* msg, uint32_t value, const char* suffix = "");
@@ -45,10 +63,17 @@ namespace esphome {
 
         CN105Climate(uart::UARTComponent* hw_serial);
 
+        enum class VaneType {
+            STANDARD = 0,
+            SPLIT_HORIZONTAL = 1,
+            SPLIT_VERTICAL = 2
+        };
+
         void set_vertical_vane_select(VaneOrientationSelect* vertical_vane_select);
         void set_horizontal_vane_select(VaneOrientationSelect* horizontal_vane_select, const std::vector<std::string>& options = {});
         void set_airflow_control_select(VaneOrientationSelect* airflow_control_select);
         void set_compressor_frequency_sensor(esphome::sensor::Sensor* compressor_frequency_sensor);
+        void set_target_humidity_sensor(esphome::sensor::Sensor* target_humidity_sensor);
         void set_input_power_sensor(esphome::sensor::Sensor* input_power_sensor);
         void set_kwh_sensor(esphome::sensor::Sensor* kwh_sensor);
         void set_runtime_hours_sensor(esphome::sensor::Sensor* runtime_hours_sensor);
@@ -63,6 +88,14 @@ namespace esphome {
 
         void add_hardware_setting(HardwareSettingSelect* setting);
         void set_hardware_settings_interval(uint32_t interval_ms) { this->hardware_settings_interval_ms_ = interval_ms; }
+        
+        // Deprecated: kept for backward compatibility, will map to VaneType::SPLIT_HORIZONTAL
+        void set_horizontal_vanes(int horizontal_vanes) { 
+            if (horizontal_vanes > 1) {
+                this->vane_type_ = VaneType::SPLIT_HORIZONTAL;
+            }
+        }
+        void set_vane_type(VaneType type) { this->vane_type_ = type; }
 
         void set_functions_sensor(esphome::text_sensor::TextSensor* Functions_sensor);
         void set_functions_get_button(FunctionsButton* Button);
@@ -72,10 +105,18 @@ namespace esphome {
 
         void set_sub_mode_sensor(esphome::text_sensor::TextSensor* Sub_mode_sensor);
         void set_auto_sub_mode_sensor(esphome::text_sensor::TextSensor* Auto_sub_mode_sensor);
-        void set_hp_uptime_connection_sensor(uptime::HpUpTimeConnectionSensor* hp_up_connection_sensor);
+        void set_error_code_sensor(esphome::text_sensor::TextSensor* error_code_sensor);
+        void set_remote_temp_source(esphome::sensor::Sensor* source);
+        void set_remote_temp_source_info_sensor(esphome::text_sensor::TextSensor* info_sensor);
+        void set_hp_uptime_connection_sensor(cn105::HpUpTimeConnectionSensor* hp_up_connection_sensor);
+        
+        void set_remote_temperature_control_sensor(esphome::binary_sensor::BinarySensor* sensor);
+        void set_remote_temperature_margin(float margin);
 
         //sensor::Sensor* compressor_frequency_sensor;
         binary_sensor::BinarySensor* iSee_sensor_ = nullptr;
+        binary_sensor::BinarySensor* remote_temp_sensor_ = nullptr;
+        float remote_temp_margin_ = 0.4f;
         text_sensor::TextSensor* stage_sensor_{ nullptr }; // to save ref if needed
         bool use_stage_for_operating_status_{ false };
         FahrenheitSupport fahrenheitSupport_;
@@ -86,6 +127,9 @@ namespace esphome {
         FunctionsNumber* Functions_set_value_ = nullptr;
         text_sensor::TextSensor* Sub_mode_sensor_ = nullptr;
         text_sensor::TextSensor* Auto_sub_mode_sensor_ = nullptr;
+        text_sensor::TextSensor* error_code_sensor_{ nullptr };
+        sensor::Sensor* remote_temp_source_{ nullptr };
+        text_sensor::TextSensor* remote_temp_source_info_sensor_{ nullptr };
         HVACOptionSwitch* air_purifier_switch_ = nullptr;
         HVACOptionSwitch* night_mode_switch_ = nullptr;
         HVACOptionSwitch* circulator_switch_ = nullptr;
@@ -108,6 +152,8 @@ namespace esphome {
             nullptr;
         sensor::Sensor* compressor_frequency_sensor_ =
             nullptr;  // Sensor to store compressor frequency
+        sensor::Sensor* target_humidity_sensor_ =
+            nullptr;  // Sensor to expose target humidity from 0x02 settings packet (byte 12)
         sensor::Sensor* input_power_sensor_ =
             nullptr;  // Sensor to store compressor frequency
         sensor::Sensor* kwh_sensor_ =
@@ -118,8 +164,10 @@ namespace esphome {
             nullptr;  // Outside air temperature
 
         // sensor to monitor heatpump connection time
-        uptime::HpUpTimeConnectionSensor* hp_uptime_connection_sensor_ = nullptr;
+        cn105::HpUpTimeConnectionSensor* hp_uptime_connection_sensor_ = nullptr;
 
+        float convert_input_power_to_W(float raw_input_power);
+        float convert_energy_usage_to_kWh(float raw_energy_usage);
         float get_compressor_frequency();
         float get_input_power();
         float get_kwh();
@@ -130,11 +178,16 @@ namespace esphome {
         bool is_circulator();
 
         // checks if the field has changed
+
         bool hasChanged(const char* before, const char* now, const char* field, bool checkNotNull = false);
+
+        inline bool hasChanged(esphome::StringRef before, const char* now, const char* field, bool checkNotNull = false) {
+            return hasChanged(std::string(before).c_str(), now, field, checkNotNull);
+        }
 
 
         float get_setup_priority() const override {
-            return setup_priority::AFTER_WIFI;  // Configurez ce composant après le WiFi
+            return setup_priority::AFTER_WIFI;  // Configurez ce composant aprÃÂ¨s le WiFi
         }
 
         void generateExtraComponents();
@@ -155,21 +208,38 @@ namespace esphome {
         bool isHeatpumpConnectionActive();
         void reconnectIfConnectionLost();
 
+        // FSM
+        DriverState driver_state() const { return state_; }
+        void transition_to_(DriverState next);
+        // Compatibility accessors (replace former booleans)
+        bool isUARTReady_() const { return state_ >= DriverState::CONNECTING; }
+        bool isHeatpumpConnected() const { return state_ == DriverState::CONNECTED; }
+
         void sendWantedSettings();
         void sendWantedSettingsDelegate();
         // Use the temperature from an external sensor. Use
         // set_remote_temp(0) to switch back to the internal sensor.
         void set_remote_temperature(float);
         void sendRemoteTemperature();
+        void sendRemoteTemperaturePacket();  // Send packet only, without resetting watchdog
         void sendWantedRunStates();
         float getDeadbandAdjustedTemperature(float remoteTemperature);
 
         void set_remote_temp_timeout(uint32_t timeout);
 
+        // Configure the interval for remote temperature keep-alive (in milliseconds)
+        // Set to 0 to disable keep-alive
+        void set_remote_temp_keepalive_interval(uint32_t interval_ms);
+
         void set_debounce_delay(uint32_t delay);
 
         // this is the ping or heartbeat of the setRemotetemperature for timeout management
         void pingExternalTemperature();
+
+        // Start/stop the remote temperature keep-alive timer
+        // Keep-alive periodically re-sends the remote temperature to prevent PAC fallback to internal sensor
+        void startRemoteTempKeepAlive();
+        void stopRemoteTempKeepAlive();
 
         uint32_t get_update_interval() const;
         void set_update_interval(uint32_t update_interval);
@@ -195,20 +265,26 @@ namespace esphome {
 
         void controlFan();
         void controlSwing();
-        // Bootstrap connexion CN105 en loop() (évite de perdre les tout premiers logs OTA)
+        // Bootstrap connexion CN105 en loop() (ÃÂ©vite de perdre les tout premiers logs OTA)
         void maybe_start_connection_();
 
-        // Délai de grâce configurable avant d'envoyer CONNECT (pour laisser le flux OTA s'attacher)
+        // DÃÂ©lai de grÃÂ¢ce configurable avant d'envoyer CONNECT (pour laisser le flux OTA s'attacher)
         void set_connection_bootstrap_delay(uint32_t delay_ms) { this->conn_bootstrap_delay_ms_ = delay_ms; }
 
-        // Mode installateur: utilise un handshake CONNECT étendu (0x5B) au lieu du standard (0x5A)
+        // Mode installateur: utilise un handshake CONNECT ÃÂ©tendu (0x5B) au lieu du standard (0x5A)
         void set_installer_mode(bool mode) {
-            // Mode demandé via YAML
+            // Mode demandÃÂ© via YAML
             this->installer_mode_ = mode;
-            // Mode effectivement utilisé: peut tomber en fallback vers standard si la PAC ignore 0x5B
+            // Mode effectivement utilisÃÂ©: peut tomber en fallback vers standard si la PAC ignore 0x5B
             this->installer_mode_effective_ = mode;
             this->installer_mode_fallback_done_ = false;
         }
+
+        // UnitÃÂ© de puissance brute envoyÃÂ©e par la PAC: false = Watts (dÃÂ©faut), true = BTU/s
+        void set_power_unit_is_btu(bool v) { this->power_unit_is_btu_ = v; }
+
+        // Opt-in (supports.restore_setpoints): persist HEAT_COOL band across reboots
+        void set_restore_setpoints(bool v) { this->restore_setpoints_ = v; }
 
         // Configure the climate object with traits that we support.
 
@@ -216,8 +292,9 @@ namespace esphome {
         /// le bouton de setup de l'UART
         bool uart_setup_switch;
 
-        bool isUARTConnected_ = false;
-        bool isHeatpumpConnected_ = false;
+        // Legacy booleans replaced by DriverState FSM (see state_)
+        // bool isUARTConnected_  → isUARTReady_()
+        // bool isHeatpumpConnected_ → isHeatpumpConnected()
         bool shouldSendExternalTemperature_ = false;
         float remoteTemperature_ = 0;
 
@@ -231,10 +308,10 @@ namespace esphome {
         //bool can_proceed() override;
 
 
-        void getFunctions();
-        void getFunctionsPart2();
         void functionsArrived();
         bool setFunctions(heatpumpFunctions const& functions);
+        bool isGetFunctions_ = false;
+        bool isSetFunctions_ = false;
 
         // helpers
         const char* getIfNotNull(const char* what, const char* defaultValue);
@@ -266,11 +343,9 @@ namespace esphome {
         }
 
         bool processInput(void);
-        void parse(uint8_t inputData);
-        void checkHeader(uint8_t inputData);
-        void initBytePointer();
         void processDataPacket();
-        void getDataFromResponsePacket();
+        void getErrorInfoFromResponsePacket();
+    void getDataFromResponsePacket();
         void getAutoModeStateFromResponsePacket(); //NET added
         void getPowerFromResponsePacket(); //NET added
         void getSettingsFromResponsePacket();
@@ -280,7 +355,7 @@ namespace esphome {
 
         void updateSuccess();
         void processCommand();
-        bool checkSum();
+
         uint8_t checkSum(uint8_t bytes[], int len);
 
         const char* getModeSetting();
@@ -337,7 +412,7 @@ namespace esphome {
         void updateAction();
         void setActionIfOperatingTo(climate::ClimateAction action);
         void setActionIfOperatingAndCompressorIsActiveTo(climate::ClimateAction action);
-        void hpPacketDebug(uint8_t* packet, unsigned int length, const char* packetDirection);
+        void hpPacketDebug(const uint8_t* packet, unsigned int length, const char* packetDirection, const char* log_prefix = "");
         void hpFunctionsDebug(uint8_t* packet, unsigned int length);
 
         void debugSettings(const char* settingName, heatpumpSettings& settings);
@@ -373,7 +448,7 @@ namespace esphome {
         wantedHeatpumpRunStates wantedRunStates{};
         cycleManagement loopCycle{};
 
-        // Orchestrateur des requêtes INFO
+        // Orchestrateur des requÃÂªtes INFO
         RequestScheduler scheduler_;
         void registerInfoRequests();
         void registerHardwareSettingsRequests();
@@ -388,6 +463,12 @@ namespace esphome {
 
 
         uint32_t remote_temp_timeout_;
+        uint32_t remote_temp_keepalive_interval_ms_ = DEFAULT_REMOTE_TEMP_KEEPALIVE_INTERVAL_MS;
+        bool remote_temp_keepalive_active_ = false;
+        uint32_t last_remote_temp_send_ms_ = 0;      // Timestamp of last remote temp packet sent
+        float last_remote_temp_sent_ = 0;            // Last remote temp value actually sent (for change detection)
+        uint8_t remote_temp_debounce_skip_count_ = 0;   // Counter for consecutive debounce skips
+        bool remote_temp_heartbeat_warning_shown_ = false;  // Avoid spamming the warning
         uint32_t debounce_delay_;
 
         int baud_ = 0;
@@ -401,14 +482,14 @@ namespace esphome {
         unsigned long lastConnectRqTimeMs;
         unsigned long lastReconnectTimeMs;
 
-        uint8_t storedInputData[MAX_DATA_BYTES]; // multi-byte data
+        cn105_protocol::FrameParser parser_;     // UART frame assembler (Phase 3A)
         uint8_t* data;
 
-        // initialise to all off, then it will update shortly after connect;
-        heatpumpStatus currentStatus{ 0, 0, false, {TIMER_MODE_MAP[0], 0, 0, 0, 0}, 0, 0, 0, 0 };
+        // All fields are default-initialized via heatpumpStatus struct defaults (NAN, false, etc.)
+        heatpumpStatus currentStatus{};
         heatpumpFunctions functions;
 
-        bool tempMode = false;
+        bool use_temperature_encoding_b_ = false;
         bool wideVaneAdj;
         bool autoUpdate;
         bool firstRun;
@@ -424,35 +505,49 @@ namespace esphome {
         bool isReading = false;
         bool isWriting = false;
 
-        bool foundStart = false;
-        int bytesRead = 0;
-        int dataLength = 0;
-        uint8_t command = 0;
+        // foundStart, bytesRead, dataLength, command → moved into parser_ (Phase 3A)
 
         // Ensure dual setpoints are valid (no NaN, enforce spread in AUTO)
         void sanitizeDualSetpoints();
 
-        // Anti-rebond UI: mémorise le dernier côté modifié et l'instant
+        // Anti-rebond UI: mÃÂ©morise le dernier cÃÂ´tÃÂ© modifiÃÂ© et l'instant
         uint32_t last_dual_setpoint_change_ms_ = 0;
         char last_dual_setpoint_side_ = 'N'; // 'L' (low), 'H' (high), 'N' (none)
 
-        // Gestion sûre d'un paquet différé à écrire pour éviter la capture d'un buffer de pile
+        // Gestion sÃÂ»re d'un paquet diffÃÂ©rÃÂ© ÃÂ  ÃÂ©crire pour ÃÂ©viter la capture d'un buffer de pile
         void try_write_pending_packet();
         uint8_t pending_packet_[PACKET_LEN] = {};
         int pending_packet_len_ = 0;
         bool pending_check_is_active_ = true;
         bool has_pending_packet_ = false;
 
-        // Bootstrap de connexion (loop)
+        // Connection lifecycle FSM
+        DriverState state_ = DriverState::BOOT;
         uint32_t boot_ms_ = 0;
-        bool conn_bootstrap_started_ = false;
-        bool conn_wait_logged_ = false;
-        bool conn_grace_logged_ = false;
-        bool conn_timeout_armed_ = false;
-        uint32_t conn_bootstrap_delay_ms_{ 10000 };  // par défaut 10s
+        uint32_t conn_bootstrap_delay_ms_{ 10000 };  // par dÃÂ©faut 10s
 
         bool installer_mode_{ false };
         bool installer_mode_effective_{ false };
         bool installer_mode_fallback_done_{ false };
+        bool power_unit_is_btu_{ false };  // true = la PAC envoie en BTU/s (nÃÂ©cessite conversion ÃÂ3.412)
+        bool supports_dual_setpoint_ = false;
+        int horizontal_vanes_{ 1 }; // Kept for legacy logging if needed, or can be removed if unused.
+        VaneType vane_type_{ VaneType::STANDARD };
+
+        // --- HEAT_COOL setpoint persistence (opt-in via supports.restore_setpoints) ---
+        // The dual-setpoint band is synthetic (the heat pump only stores a single setpoint),
+        // so it is lost on reboot. When enabled, we persist {mode, low, high} to flash and
+        // re-seed it in setup() before the first settings read.
+        struct SetpointState {
+            uint8_t version;
+            uint8_t mode;        // climate::ClimateMode
+            float target_low;
+            float target_high;
+        } __attribute__((packed));
+        bool restore_setpoints_ = false;
+        esphome::ESPPreferenceObject setpoint_pref_;
+        bool setpoint_pref_ready_ = false;
+        void restore_setpoint_state_();
+        void save_setpoint_state_();
     };
 }

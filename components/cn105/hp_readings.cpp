@@ -5,116 +5,10 @@
 using namespace esphome;
 
 /**
- * Seek the byte pointer to the beginning of the array
- * Initializes few variables
-*/
-void CN105Climate::initBytePointer() {
-    this->foundStart = false;
-    this->bytesRead = 0;
-    this->dataLength = -1;
-    this->command = 0;
-}
-
-/**
- *
-* The total size of a frame is made up of several elements:
-  * Header size: The header has a fixed length of 5 bytes (INFOHEADER_LEN).
-  * Data Length: The data length is variable and is specified by the fourth byte of the header (header[4]).
-  * Checksum: There is 1 checksum byte at the end of the frame.
-  *
-  * The total size of a frame is therefore the sum of these elements: header size (5 bytes) + data length (variable) + checksum (1 byte).
-  * To calculate the total size, we can use the formula:
-  * Total size = 5 (header) + Data length + 1 (checksum)
-  *The total size depends on the specific data length for each individual frame.
+ * processInput: reads available bytes from UART and feeds them to the FrameParser.
+ * When a complete frame is detected, delegates to processDataPacket().
  */
-void CN105Climate::parse(uint8_t inputData) {
 
-    ESP_LOGV("Decoder", "--> %02X [nb: %d]", inputData, this->bytesRead);
-
-    if (!this->foundStart) {                // no packet yet
-        if (inputData == HEADER[0]) {
-            this->foundStart = true;
-            this->bytesRead = 0;
-            storedInputData[this->bytesRead++] = inputData;
-        } else {
-            // unknown bytes
-        }
-    } else {                                // we are getting a packet
-        if (this->bytesRead >= (MAX_DATA_BYTES - 1)) {
-            ESP_LOGW("Decoder", "buffer overflow preventive reset (bytesRead=%d)", this->bytesRead);
-            this->initBytePointer();
-            return;
-        }
-        storedInputData[this->bytesRead] = inputData;
-
-        checkHeader(inputData);
-
-        if (this->dataLength != -1) {       // is header complete ?
-            if ((this->dataLength + 6) > MAX_DATA_BYTES) {
-                ESP_LOGW("Decoder", "declared data length %d too large, resetting parser", this->dataLength);
-                this->initBytePointer();
-                return;
-            }
-
-            if ((this->bytesRead) == this->dataLength + 5) {
-
-                this->processDataPacket();
-                this->initBytePointer();
-            } else {                                        // packet is still filling
-                this->bytesRead++;                          // more data to come
-            }
-        } else {
-            ESP_LOGV("Decoder", "data length toujours pas connu");
-            // header is not complete yet
-            this->bytesRead++;
-        }
-    }
-
-}
-
-
-bool CN105Climate::checkSum() {
-    // TODO: use the CN105Climate::checkSum(byte bytes[], int len) function
-
-    uint8_t packetCheckSum = storedInputData[this->bytesRead];
-    uint8_t processedCS = 0;
-
-    ESP_LOGV("chkSum", "controling chkSum should be: %02X ", packetCheckSum);
-
-    for (int i = 0;i < this->dataLength + 5;i++) {
-        ESP_LOGV("chkSum", "adding %02X to %03X --> %X", this->storedInputData[i], processedCS, processedCS + this->storedInputData[i]);
-        processedCS += this->storedInputData[i];
-    }
-
-    processedCS = (0xfc - processedCS) & 0xff;
-
-    if (packetCheckSum == processedCS) {
-        ESP_LOGD("chkSum", "OK-> %02X=%02X ", processedCS, packetCheckSum);
-    } else {
-        ESP_LOGW("chkSum", "KO-> %02X!=%02X ", processedCS, packetCheckSum);
-        // Pendant le handshake, une erreur de checksum est un signal utile: logguer la trame sous CN105_CONN
-        if (!this->isHeatpumpConnected_) {
-            ESP_LOGD(LOG_CONN_TAG, "Checksum KO during handshake (computed=%02X packet=%02X, cmd=0x%02X len=%d)",
-                processedCS, packetCheckSum, this->command, this->dataLength);
-            this->hpPacketDebug(this->storedInputData, this->bytesRead + 1, LOG_CONN_TAG);
-        }
-    }
-
-    return (packetCheckSum == processedCS);
-}
-
-
-void CN105Climate::checkHeader(uint8_t inputData) {
-    if (this->bytesRead == 4) {
-        if (storedInputData[2] == HEADER[2] && storedInputData[3] == HEADER[3]) {
-            ESP_LOGV("Header", "header matches HEADER");
-            ESP_LOGV("Header", "[%02X] (%02X) %02X %02X [%02X]<-- header", storedInputData[0], storedInputData[1], storedInputData[2], storedInputData[3], storedInputData[4]);
-            ESP_LOGD("Header", "command: (%02X) data length: [%02X]<-- header", storedInputData[1], storedInputData[4]);
-            this->command = storedInputData[1];
-        }
-        this->dataLength = storedInputData[4];
-    }
-}
 
 bool CN105Climate::processInput(void) {
     bool processed = false;
@@ -122,36 +16,55 @@ bool CN105Climate::processInput(void) {
         processed = true;
         uint8_t inputData;
         if (this->get_hw_serial_()->read_byte(&inputData)) {
-            parse(inputData);
+            ESP_LOGV("Decoder", "--> %02X", inputData);
+            this->parser_.feed(inputData);
+            if (this->parser_.frame_complete()) {
+                this->processDataPacket();
+                this->parser_.reset();
+            }
         }
-
     }
     return processed;
 }
 
+/**
+ * processDataPacket: called when the FrameParser has assembled a complete frame.
+ * Validates checksum, sets the data pointer, and dispatches to processCommand().
+ */
 void CN105Climate::processDataPacket() {
 
     ESP_LOGV(TAG, "processing data packet...");
 
-    this->data = &this->storedInputData[5];
+    // Point data at the payload section of the parser buffer
+    // Note: cast away const because downstream code uses non-const data pointer
+    this->data = const_cast<uint8_t*>(this->parser_.data());
 
-    this->hpPacketDebug(this->storedInputData, this->bytesRead + 1, "READ");
+    this->hpPacketDebug(this->parser_.raw(), this->parser_.frame_size(), "READ");
 
-    // Pendant le handshake (tant que non connecté), logguer toute trame RX sous CN105_CONN en DEBUG
-    // afin de faciliter le diagnostic (0x7A/0x7B attendus, ou autre réponse inattendue).
-    if (!this->isHeatpumpConnected_) {
-        ESP_LOGD(LOG_CONN_TAG, "RX during handshake (cmd=0x%02X len=%d)", this->command, this->dataLength);
-        this->hpPacketDebug(this->storedInputData, this->bytesRead + 1, LOG_CONN_TAG);
+    // During handshake, log every received frame for diagnostics
+    if (!this->isHeatpumpConnected()) {
+        ESP_LOGD(LOG_CONN_TAG, "RX during handshake (cmd=0x%02X len=%d)",
+            this->parser_.command(), this->parser_.data_length());
+        this->hpPacketDebug(this->parser_.raw(), this->parser_.frame_size(), LOG_CONN_TAG);
     }
 
-    if (this->checkSum()) {
-        // checkPoint of a heatpump response
-        this->lastResponseMs = CUSTOM_MILLIS;    //esphome::CUSTOM_MILLIS;
+    if (this->parser_.checksum_valid()) {
+        ESP_LOGD("chkSum", "OK");
+        // checkpoint of a heatpump response
+        this->lastResponseMs = CUSTOM_MILLIS;
 
         // processing the specific command
         processCommand();
+    } else {
+        ESP_LOGW("chkSum", "KO -> checksum mismatch (cmd=0x%02X len=%d)",
+            this->parser_.command(), this->parser_.data_length());
+        if (!this->isHeatpumpConnected()) {
+            ESP_LOGD(LOG_CONN_TAG, "Checksum KO during handshake");
+            this->hpPacketDebug(this->parser_.raw(), this->parser_.frame_size(), LOG_CONN_TAG);
+        }
     }
 }
+
 
 
 void CN105Climate::getAutoModeStateFromResponsePacket() {
@@ -176,9 +89,37 @@ void CN105Climate::getPowerFromResponsePacket() {
     ESP_LOGD("Decoder", "[0x09 is sub modes]");
 
     heatpumpSettings receivedSettings{};
-    receivedSettings.stage = lookupByteMapValue(STAGE_MAP, STAGE, 7, data[4], "current stage for delivery");
-    receivedSettings.sub_mode = lookupByteMapValue(SUB_MODE_MAP, SUB_MODE, 4, data[3], "submode");
-    receivedSettings.auto_sub_mode = lookupByteMapValue(AUTO_SUB_MODE_MAP, AUTO_SUB_MODE, 4, data[5], "auto mode sub mode");
+
+    // Use std::optional lookups — keep previous value on unknown bytes
+    auto stage_opt = cn105_protocol::lookup_value_opt(STAGE_MAP, STAGE, 7, data[4]);
+    if (stage_opt) {
+        receivedSettings.stage = *stage_opt;
+    } else {
+        ESP_LOGW("Decoder", "Unknown stage byte 0x%02X — keeping previous value", data[4]);
+        receivedSettings.stage = this->currentSettings.stage
+            ? this->currentSettings.stage
+            : STAGE_MAP[0];  // default to "IDLE" when no prior value exists
+    }
+
+    auto sub_mode_opt = cn105_protocol::lookup_value_opt(SUB_MODE_MAP, SUB_MODE, 6, data[3]);
+    if (sub_mode_opt) {
+        receivedSettings.sub_mode = *sub_mode_opt;
+    } else {
+        ESP_LOGW("Decoder", "Unknown sub_mode byte 0x%02X — keeping previous value", data[3]);
+        receivedSettings.sub_mode = this->currentSettings.sub_mode
+            ? this->currentSettings.sub_mode
+            : SUB_MODE_MAP[0];  // default to "NORMAL" when no prior value exists
+    }
+
+    auto auto_sub_mode_opt = cn105_protocol::lookup_value_opt(AUTO_SUB_MODE_MAP, AUTO_SUB_MODE, 7, data[5]);
+    if (auto_sub_mode_opt) {
+        receivedSettings.auto_sub_mode = *auto_sub_mode_opt;
+    } else {
+        ESP_LOGW("Decoder", "Unknown auto_sub_mode byte 0x%02X — keeping previous value", data[5]);
+        receivedSettings.auto_sub_mode = this->currentSettings.auto_sub_mode
+            ? this->currentSettings.auto_sub_mode
+            : AUTO_SUB_MODE_MAP[0];  // default to "AUTO_OFF" when no prior value exists
+    }
 
     ESP_LOGD("Decoder", "[Stage : %s]", receivedSettings.stage);
     ESP_LOGD("Decoder", "[Sub Mode  : %s]", receivedSettings.sub_mode);
@@ -214,9 +155,28 @@ void CN105Climate::getSettingsFromResponsePacket() {
     ESP_LOGD("Decoder", "[0x02 is settings]");
 
     receivedSettings.connected = true;
-    receivedSettings.power = lookupByteMapValue(POWER_MAP, POWER, 2, data[3], "power reading");
+
+    auto power_opt = cn105_protocol::lookup_value_opt(POWER_MAP, POWER, 2, data[3]);
+    if (power_opt) {
+        receivedSettings.power = *power_opt;
+    } else {
+        ESP_LOGW("Decoder", "Unknown power byte 0x%02X — keeping previous value", data[3]);
+        receivedSettings.power = this->currentSettings.power
+            ? this->currentSettings.power
+            : POWER_MAP[0];  // default to "OFF" when no prior value exists
+    }
+
     receivedSettings.iSee = data[4] > 0x08 ? true : false;
-    receivedSettings.mode = lookupByteMapValue(MODE_MAP, MODE, 5, receivedSettings.iSee ? (data[4] - 0x08) : data[4], "mode reading");
+    uint8_t modeByte = receivedSettings.iSee ? (data[4] - 0x08) : data[4];
+    auto mode_opt = cn105_protocol::lookup_value_opt(MODE_MAP, MODE, 5, modeByte);
+    if (mode_opt) {
+        receivedSettings.mode = *mode_opt;
+    } else {
+        ESP_LOGW("Decoder", "Unknown mode byte 0x%02X — keeping previous value", modeByte);
+        receivedSettings.mode = this->currentSettings.mode
+            ? this->currentSettings.mode
+            : MODE_MAP[4];  // default to "AUTO" when no prior value exists
+    }
 
     ESP_LOGD("Decoder", "[Power : %s]", receivedSettings.power);
     ESP_LOGD("Decoder", "[iSee  : %d]", receivedSettings.iSee);
@@ -226,22 +186,56 @@ void CN105Climate::getSettingsFromResponsePacket() {
         int temp = data[11];
         temp -= 128;
         receivedSettings.temperature = (float)temp / 2;
-        this->tempMode = true;
+        this->use_temperature_encoding_b_ = true;
     } else {
-        receivedSettings.temperature = lookupByteMapValue(TEMP_MAP, TEMP, 16, data[5], "temperature reading");
+        auto temp_opt = cn105_protocol::lookup_value_opt(TEMP_MAP, TEMP, 16, data[5]);
+        if (temp_opt) {
+            receivedSettings.temperature = static_cast<float>(*temp_opt);
+        } else {
+            ESP_LOGW("Decoder", "Unknown temperature byte 0x%02X — keeping previous value", data[5]);
+            receivedSettings.temperature = this->currentSettings.temperature;
+        }
     }
 
     ESP_LOGD("Decoder", "[Temp °C: %f]", receivedSettings.temperature);
 
-    receivedSettings.fan = lookupByteMapValue(FAN_MAP, FAN, 6, data[6], "fan reading");
+    auto fan_opt = cn105_protocol::lookup_value_opt(FAN_MAP, FAN, 6, data[6]);
+    if (fan_opt) {
+        receivedSettings.fan = *fan_opt;
+    } else {
+        ESP_LOGW("Decoder", "Unknown fan byte 0x%02X — keeping previous value", data[6]);
+        receivedSettings.fan = this->currentSettings.fan
+            ? this->currentSettings.fan
+            : FAN_MAP[0];  // default to "AUTO" when no prior value exists
+    }
     ESP_LOGD("Decoder", "[Fan: %s]", receivedSettings.fan);
 
-    receivedSettings.vane = lookupByteMapValue(VANE_MAP, VANE, 7, data[7], "vane reading");
+    auto vane_opt = cn105_protocol::lookup_value_opt(VANE_MAP, VANE, 7, data[7]);
+    if (vane_opt) {
+        receivedSettings.vane = *vane_opt;
+    } else {
+        ESP_LOGW("Decoder", "Unknown vane byte 0x%02X — keeping previous value", data[7]);
+        receivedSettings.vane = this->currentSettings.vane
+            ? this->currentSettings.vane
+            : VANE_MAP[0];  // default to "AUTO" when no prior value exists
+    }
     ESP_LOGD("Decoder", "[Vane: %s]", receivedSettings.vane);
 
     // --- START OF MODIFIED SECTION - Reverted widevane section back to more or less original state
     if ((data[10] != 0) && (this->traits_.supports_swing_mode(climate::CLIMATE_SWING_HORIZONTAL))) {    // wideVane is not always supported
-        receivedSettings.wideVane = lookupByteMapValue(WIDEVANE_MAP, WIDEVANE, 8, data[10] & 0x0F, "wideVane reading");
+        uint8_t wideVaneByte = data[10] & 0x0F;
+        auto wideVane_opt = cn105_protocol::lookup_value_opt(WIDEVANE_MAP, WIDEVANE, 8, wideVaneByte);
+        if (wideVane_opt) {
+            receivedSettings.wideVane = *wideVane_opt;
+        } else {
+            ESP_LOGW("Decoder", "Unknown wideVane byte 0x%02X — keeping previous value", wideVaneByte);
+            // Guard against null: on the first settings packet currentSettings.wideVane
+            // is still nullptr, and an unknown byte here would otherwise propagate a null
+            // pointer into the %s log below (and downstream), panicking the ESP32.
+            receivedSettings.wideVane = this->currentSettings.wideVane
+                ? this->currentSettings.wideVane
+                : WIDEVANE_MAP[2];  // default to "|" (center) when no prior value exists
+        }
         this->wideVaneAdj = (data[10] & 0xF0) == 0x80 ? true : false;
         ESP_LOGD("Decoder", "[wideVane: %s (adj:%d)]", receivedSettings.wideVane, this->wideVaneAdj);
     } else {
@@ -253,11 +247,35 @@ void CN105Climate::getSettingsFromResponsePacket() {
         this->iSee_sensor_->publish_state(receivedSettings.iSee);
     }
 
+    // --- TARGET HUMIDITY (byte 12 of 0x02 settings packet) ---
+    // Some premium models (e.g. MSZ-LN series) store a target humidity
+    // percentage in data[12]. This value changes when the mode is switched
+    // via the IR remote (e.g. COOL→70%, DRY→50%, HEAT→40%).
+    // Not all models populate this byte — it may read 0x00 on unsupported units.
+    if (this->target_humidity_sensor_ != nullptr) {
+        uint8_t raw_humidity = data[12];
+        if (raw_humidity > 0 && raw_humidity <= 100) {
+            float humidity_pct = static_cast<float>(raw_humidity);
+            if (this->target_humidity_sensor_->get_raw_state() != humidity_pct) {
+                ESP_LOGD("Decoder", "[Target Humidity: %.0f%%]", humidity_pct);
+                this->target_humidity_sensor_->publish_state(humidity_pct);
+            }
+        } else if (raw_humidity != 0) {
+            ESP_LOGD("Decoder", "[Target Humidity byte out of range: 0x%02X]", raw_humidity);
+        }
+    }
+
     // --- AIRFLOW CONTROL START
     if (this->airflow_control_select_ != nullptr) {
         if (data[10] == 0x80) {
             if (receivedSettings.iSee) {
-                receivedRunStates.airflow_control = lookupByteMapValue(AIRFLOW_CONTROL_MAP, AIRFLOW_CONTROL, 3, data[14], "airflow control reading");
+                auto airflow_opt = cn105_protocol::lookup_value_opt(AIRFLOW_CONTROL_MAP, AIRFLOW_CONTROL, 3, data[14]);
+                if (airflow_opt) {
+                    receivedRunStates.airflow_control = *airflow_opt;
+                } else {
+                    ESP_LOGW("Decoder", "Unknown airflow_control byte 0x%02X — keeping previous value", data[14]);
+                    receivedRunStates.airflow_control = this->currentRunStates.airflow_control;
+                }
             } else {
                 // For some reason data[10] is 0x80, but the i-See sensor is not active. 
                 // Some units let us do this, but the real mode is unknown (might be powersave) and the i-See sensor does not get activated.
@@ -305,8 +323,26 @@ void CN105Climate::getRoomTemperatureFromResponsePacket() {
         receivedStatus.roomTemperature = temp / 2.0f;
         ESP_LOGD(LOG_TEMP_SENSOR_TAG, "data[6]  --> [Room °C: %f]", receivedStatus.roomTemperature);
     } else {
-        receivedStatus.roomTemperature = lookupByteMapValue(ROOM_TEMP_MAP, ROOM_TEMP, 32, data[3]);
+        auto room_temp_opt = cn105_protocol::lookup_value_opt(ROOM_TEMP_MAP, ROOM_TEMP, 32, data[3]);
+        if (room_temp_opt) {
+            receivedStatus.roomTemperature = static_cast<float>(*room_temp_opt);
+        } else {
+            ESP_LOGW("Decoder", "Unknown room_temp byte 0x%02X — keeping previous value", data[3]);
+            receivedStatus.roomTemperature = this->currentStatus.roomTemperature;
+        }
         ESP_LOGD(LOG_TEMP_SENSOR_TAG, "data[3] map --> [Room °C : %f]", receivedStatus.roomTemperature);
+    }
+
+    // Update the remote temperature control sensor (Issue 290)
+    if (this->remote_temp_sensor_ != nullptr) {
+        bool is_remote = false;
+        if (this->remote_temp_keepalive_active_ && this->remoteTemperature_ > 0) {
+            float diff = abs(receivedStatus.roomTemperature - this->remoteTemperature_);
+            if (diff <= this->remote_temp_margin_) {
+                is_remote = true;
+            }
+        }
+        this->remote_temp_sensor_->publish_state(is_remote);
     }
 
     receivedStatus.runtimeHours = float((data[11] << 16) | (data[12] << 8) | data[13]) / 60;
@@ -341,9 +377,11 @@ void CN105Climate::getOperatingAndCompressorFreqFromResponsePacket() {
     // reset counter (because a reply indicates it is connected)
     this->nonResponseCounter = 0;
     receivedStatus.operating = data[4];
-    receivedStatus.compressorFrequency = data[3];
-    receivedStatus.inputPower = (data[5] << 8) | data[6];
-    receivedStatus.kWh = float((data[7] << 8) | data[8]) / 10;
+    // Some models (e.g. PAA/PUZ combo) seem to have some noise on the compressor frequency sensor, even when not in operation.
+    // To avoid reporting random values, set the compressor frequency to 0 when the heatpump is not operating.
+    receivedStatus.compressorFrequency = (data[4]) ? data[3] : 0;
+    receivedStatus.inputPower = convert_input_power_to_W(float((data[5] << 8) | data[6]));
+    receivedStatus.kWh = convert_energy_usage_to_kWh(float((data[7] << 8) | data[8]));
 
     // no change with this packet to roomTemperature
     receivedStatus.roomTemperature = currentStatus.roomTemperature;
@@ -398,14 +436,26 @@ void CN105Climate::terminateCycle() {
 
     this->loopCycle.cycleEnded();
 
-    if (this->hp_uptime_connection_sensor_ != nullptr) {
-        // if the uptime connection sensor is configured
-        // we trigger  manual update at the end of a cycle.
-        this->hp_uptime_connection_sensor_->update();
-    }
-
     this->nbCompleteCycles_++;
 }
+void CN105Climate::getErrorInfoFromResponsePacket() {
+    ESP_LOGD("Decoder", "0x04 error info");
+    if (this->error_code_sensor_ != nullptr) {
+        uint8_t error_raw = this->data[4];
+        uint8_t error_sub = this->data[5];
+        // Bit 7 (0x80) is a protocol status flag ("error reporting available"),
+        // not an actual error code. Use lower 7 bits for real error detection.
+        uint8_t error_code = error_raw & 0x7F;
+        if (error_code == 0x00 && error_sub == 0x00) {
+            this->error_code_sensor_->publish_state("No Error");
+        } else {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "Error 0x%02X sub 0x%02X", error_code, error_sub);
+            this->error_code_sensor_->publish_state(buf);
+        }
+    }
+}
+
 void CN105Climate::getDataFromResponsePacket() {
 
     // D'abord, laissons l'orchestrateur traiter les codes connus
@@ -413,14 +463,14 @@ void CN105Climate::getDataFromResponsePacket() {
     if (this->scheduler_.process_response(code)) {
         return;
     }
-    // Sinon, switch pour les cas non gérés par l'orchestrateur
+    // Sinon, switch pour les cas non gÃÂ©rÃÂ©s par l'orchestrateur
     switch (code) {
 
     case 0x04:
-        /* unknown */
-        ESP_LOGI("Decoder", "[0x04 is unknown : not implemented]");
-        //this->last_received_packet_sensor->publish_state("0x62-> 0x04: Data -> Unknown");
-        break;
+        // Handled by orchestrator (r_error_info onResponse → getErrorInfoFromResponsePacket)
+        // Reaching here means the scheduler did not intercept this response — unexpected
+        ESP_LOGW("Decoder", "[0x04] reached switch fallback — should have been handled by orchestrator");
+        break; // orchestrator
 
     case 0x05:
         /* timer packet */
@@ -439,22 +489,8 @@ void CN105Climate::getDataFromResponsePacket() {
         break;
 
     case 0x20: // fallthrough
-    case 0x22: {
-        ESP_LOGD("Decoder", "[Packet Functions 0x20 et 0x22]");
-        //this->last_received_packet_sensor->publish_state("0x62-> 0x20/0x22: Data -> Packet functions");
-        if (dataLength == 0x10) {
-            if (data[0] == 0x20) {
-                functions.setData1(&data[1]);
-                ESP_LOGI(LOG_CYCLE_TAG, "Got functions packet 1, requesting part 2");
-                this->getFunctionsPart2();
-            } else {
-                functions.setData2(&data[1]);
-                ESP_LOGI(LOG_CYCLE_TAG, "Got functions packet 2");
-                this->functionsArrived();
-            }
-        }
-    }
-             break;
+    case 0x22:
+        break; // orchestrator
 
     case 0x42:
         break; // orchestrator
@@ -474,9 +510,9 @@ void CN105Climate::updateSuccess() {
 }
 
 void CN105Climate::processCommand() {
-    switch (this->command) {
+    switch (this->parser_.command()) {
     case 0x61:  /* last update was successful */
-        this->hpPacketDebug(this->storedInputData, this->bytesRead + 1, LOG_ACK);
+        this->hpPacketDebug(this->parser_.raw(), this->parser_.frame_size(), LOG_ACK);
         this->updateSuccess();
         break;
 
@@ -485,12 +521,12 @@ void CN105Climate::processCommand() {
         break;
     case 0x7a:  // Connection success (User / standard)
     case 0x7b:  // Connection success (Installer / extended)
-        // Log en INFO sur le tag dédié, détails en DEBUG via hpPacketDebug
+        // Log en INFO sur le tag dÃÂ©diÃÂ©, dÃÂ©tails en DEBUG via hpPacketDebug
         ESP_LOGI(LOG_CONN_TAG, "--> Heatpump did reply: connection success (%s, 0x%02X)! <--",
-            (this->command == 0x7b) ? "Installer" : "User",
-            this->command);
-        this->hpPacketDebug(this->storedInputData, this->bytesRead + 1, LOG_CONN_TAG);
-        //this->isHeatpumpConnected_ = true;
+            (this->parser_.command() == 0x7b) ? "Installer" : "User",
+            this->parser_.command());
+        this->hpPacketDebug(this->parser_.raw(), this->parser_.frame_size(), LOG_CONN_TAG);
+        // isHeatpumpConnected_ replaced by FSM transition in setHeatpumpConnected()
         this->setHeatpumpConnected(true);
         // let's say that the last complete cycle was over now
         this->loopCycle.lastCompleteCycleMs = CUSTOM_MILLIS;
@@ -737,11 +773,27 @@ void CN105Climate::checkPowerAndModeSettings(heatpumpSettings& settings, bool up
         }
         if (strcmp(settings.power, "ON") == 0) {
             if (strcmp(settings.mode, "HEAT") == 0) {
-                this->mode = climate::CLIMATE_MODE_HEAT;
+                // A dual-setpoint unit driven in HEAT_COOL runs the heat pump in
+                // hardware AUTO, and the unit reports its *active operating
+                // direction* ("HEAT" here) back in the settings packet. Letting
+                // that overwrite this->mode silently drops the user out of
+                // HEAT_COOL and collapses the dual band to a single setpoint
+                // (updateTargetTemperaturesFromSettings then runs single-setpoint).
+                // Keep HEAT_COOL; the operating direction is surfaced separately
+                // by the auto_sub_mode sensor.
+                if (!(this->supports_dual_setpoint_ &&
+                      this->mode == climate::CLIMATE_MODE_HEAT_COOL)) {
+                    this->mode = climate::CLIMATE_MODE_HEAT;
+                }
             } else if (strcmp(settings.mode, "DRY") == 0) {
                 this->mode = climate::CLIMATE_MODE_DRY;
             } else if (strcmp(settings.mode, "COOL") == 0) {
-                this->mode = climate::CLIMATE_MODE_COOL;
+                // Same as the HEAT branch: hardware AUTO reports "COOL" as the
+                // active operating direction; don't let it clobber HEAT_COOL.
+                if (!(this->supports_dual_setpoint_ &&
+                      this->mode == climate::CLIMATE_MODE_HEAT_COOL)) {
+                    this->mode = climate::CLIMATE_MODE_COOL;
+                }
                 /*if (cool_setpoint != currentSettings.temperature) {
                     cool_setpoint = currentSettings.temperature;
                     save(currentSettings.temperature, cool_storage);
@@ -749,7 +801,10 @@ void CN105Climate::checkPowerAndModeSettings(heatpumpSettings& settings, bool up
             } else if (strcmp(settings.mode, "FAN") == 0) {
                 this->mode = climate::CLIMATE_MODE_FAN_ONLY;
             } else if (strcmp(settings.mode, "AUTO") == 0) {
-                this->mode = climate::CLIMATE_MODE_AUTO;
+                // If we were in HEAT_COOL via HA, stay in HEAT_COOL even if HP says AUTO
+                if (this->mode != climate::CLIMATE_MODE_HEAT_COOL) {
+                    this->mode = climate::CLIMATE_MODE_AUTO;
+                }
             } else {
                 ESP_LOGW(
                     TAG,
