@@ -25,7 +25,7 @@ void CN105Climate::set_vertical_vane_select(
 
     this->vertical_vane_select_->setCallbackFunction([this](const char* setting) {
 
-        ESP_LOGD("EVT", "vane.control() -> Demande un chgt de réglage de la vane: %s", setting);
+        ESP_LOGD("EVT", "vane.control() -> Demande un chgt de rÃ©glage de la vane: %s", setting);
 
         this->setVaneSetting(setting);
         this->wantedSettings.hasChanged = true;
@@ -61,7 +61,7 @@ void CN105Climate::set_horizontal_vane_select(
     this->horizontal_vane_select_->traits.set_options(fixedOptions);
 
     this->horizontal_vane_select_->setCallbackFunction([this](const char* setting) {
-        ESP_LOGD("EVT", "wideVane.control() -> Demande un chgt de réglage de la wideVane: %s", setting);
+        ESP_LOGD("EVT", "wideVane.control() -> Demande un chgt de rÃ©glage de la wideVane: %s", setting);
 
         this->setWideVaneSetting(setting);
         this->wantedSettings.hasChanged = true;
@@ -96,6 +96,11 @@ void CN105Climate::set_airflow_control_select(
 void CN105Climate::set_compressor_frequency_sensor(
     sensor::Sensor* compressor_frequency_sensor) {
     this->compressor_frequency_sensor_ = compressor_frequency_sensor;
+}
+
+void CN105Climate::set_target_humidity_sensor(
+    sensor::Sensor* target_humidity_sensor) {
+    this->target_humidity_sensor_ = target_humidity_sensor;
 }
 
 void CN105Climate::set_input_power_sensor(
@@ -138,8 +143,14 @@ void CN105Climate::set_functions_get_button(FunctionsButton* Button) {
     this->Functions_get_button_ = Button;
     this->Functions_get_button_->setCallbackFunction([this]() {
         ESP_LOGI(LOG_CYCLE_TAG, "Retrieving functions");
-        // Get the settings from the heat pump
-        this->getFunctions();
+
+        if (this->Functions_sensor_ != nullptr) {
+            this->Functions_sensor_->publish_state("Operation pending, please wait.");
+        }
+
+        // Request function settings from the heat pump.
+        this->isGetFunctions_ = true;
+
         // The response is handled in heatpumpFunctions.cpp
         });
 }
@@ -148,7 +159,7 @@ void CN105Climate::set_functions_set_button(FunctionsButton* Button) {
     this->Functions_set_button_ = Button;
     this->Functions_set_button_->setCallbackFunction([this]() {
 
-        if (!functions.isValid()) {
+        if (!this->functions.isValid()) {
             if (this->Functions_sensor_ != nullptr) {
                 this->Functions_sensor_->publish_state("Please get the functions first.");
             }
@@ -156,10 +167,14 @@ void CN105Climate::set_functions_set_button(FunctionsButton* Button) {
         }
 
         ESP_LOGI(LOG_CYCLE_TAG, "Setting code %i to value %i", this->functions_code_, this->functions_value_);
-        functions.setValue(this->functions_code_, this->functions_value_);
+        this->functions.setValue(this->functions_code_, this->functions_value_);
+
+        if (this->Functions_sensor_ != nullptr) {
+            this->Functions_sensor_->publish_state("Operation pending, please wait.");
+        }
 
         // Now send the codes.
-        this->setFunctions(functions);
+        this->isSetFunctions_ = true;
 
         });
 }
@@ -221,7 +236,27 @@ void CN105Climate::set_auto_sub_mode_sensor(esphome::text_sensor::TextSensor* Au
     this->Auto_sub_mode_sensor_ = Auto_sub_mode_sensor;
 }
 
-void CN105Climate::set_hp_uptime_connection_sensor(uptime::HpUpTimeConnectionSensor* hp_up_connection_sensor) {
+void CN105Climate::set_error_code_sensor(esphome::text_sensor::TextSensor* error_code_sensor) {
+    this->error_code_sensor_ = error_code_sensor;
+}
+
+void CN105Climate::set_remote_temp_source(esphome::sensor::Sensor* source) {
+    this->remote_temp_source_ = source;
+    // Subscribe to source sensor state changes and auto-feed remote temperature
+    source->add_on_state_callback([this](float value) {
+        this->set_remote_temperature(value);
+    });
+}
+
+void CN105Climate::set_remote_temp_source_info_sensor(esphome::text_sensor::TextSensor* info_sensor) {
+    this->remote_temp_source_info_sensor_ = info_sensor;
+    // Publish the source sensor name on next loop
+    if (this->remote_temp_source_ != nullptr) {
+        info_sensor->publish_state(this->remote_temp_source_->get_name());
+    }
+}
+
+void CN105Climate::set_hp_uptime_connection_sensor(cn105::HpUpTimeConnectionSensor* hp_up_connection_sensor) {
     this->hp_uptime_connection_sensor_ = hp_up_connection_sensor;
 }
 
@@ -243,6 +278,6 @@ void CN105Climate::add_hardware_setting(HardwareSettingSelect* setting) {
         this->functions.setValue(setting->get_code(), int_value);
 
         // Trigger write to device
-        this->setFunctions(this->functions);
+        this->isSetFunctions_ = true;
         });
 }

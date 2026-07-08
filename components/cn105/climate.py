@@ -33,6 +33,18 @@ from esphome.const import (
     DEVICE_CLASS_DURATION,
     CONF_TX_PIN,
     CONF_RX_PIN,
+    CONF_PLATFORM,
+    CONF_INTERNAL,
+    DEVICE_CLASS_FREQUENCY,
+    DEVICE_CLASS_POWER,
+    DEVICE_CLASS_ENERGY,
+    DEVICE_CLASS_TEMPERATURE,
+    UNIT_HERTZ,
+    UNIT_WATT,
+    UNIT_KILOWATT_HOURS,
+    UNIT_CELSIUS,
+    UNIT_HOUR,
+    STATE_CLASS_MEASUREMENT,
 )
 from esphome.components.sensor import (
     CONF_UNIT_OF_MEASUREMENT as SENSOR_CONF_UNIT_OF_MEASUREMENT,
@@ -42,7 +54,7 @@ from esphome.components.sensor import (
 )
 from esphome.core import CORE, coroutine
 
-# ... (AUTO_LOAD, DEPENDENCIES, toutes les constantes CONF_XXX_SENSOR, DEFAULT_MODES - identiques à votre version) ...
+# ... (AUTO_LOAD, DEPENDENCIES, toutes les constantes CONF_XXX_SENSOR, DEFAULT_MODES - identiques ÃÂÃÂ  votre version) ...
 AUTO_LOAD = [
     "climate",
     "sensor",
@@ -55,10 +67,18 @@ AUTO_LOAD = [
     "uptime",
     "number",
 ]
-DEPENDENCIES = ["uart", "uptime"]  # Garder uart ici aussi
+DEPENDENCIES = ["uart"]  # Garder uart ici aussi
 
 CONF_SUPPORTS = "supports"
 CONF_SUPPORTS_HORIZONTAL_VANE_MODE = "horizontal_vane_mode"
+CONF_HORIZONTAL_VANES = "horizontal_vanes"
+CONF_VANE_TYPE = "vane_type"
+
+VANE_TYPES = {
+    "standard": 0,
+    "split_horizontal": 1,
+    "split_vertical": 2,
+}
 CONF_HORIZONTAL_SWING_SELECT = "horizontal_vane_select"
 CONF_VERTICAL_SWING_SELECT = "vertical_vane_select"
 CONF_COMPRESSOR_FREQUENCY_SENSOR = "compressor_frequency_sensor"
@@ -66,6 +86,7 @@ CONF_INPUT_POWER_SENSOR = "input_power_sensor"
 CONF_KWH_SENSOR = "kwh_sensor"
 CONF_RUNTIME_HOURS_SENSOR = "runtime_hours_sensor"
 CONF_OUTSIDE_AIR_TEMPERATURE_SENSOR = "outside_air_temperature_sensor"
+CONF_TARGET_HUMIDITY_SENSOR = "target_humidity_sensor"
 CONF_ISEE_SENSOR = "isee_sensor"
 CONF_FUNCTIONS_SENSOR = "functions_sensor"
 CONF_FUNCTIONS_BUTTON = "functions_get_button"
@@ -75,6 +96,10 @@ CONF_FUNCTIONS_SET_VALUE = "functions_set_value"
 CONF_STAGE_SENSOR = "stage_sensor"
 CONF_SUB_MODE_SENSOR = "sub_mode_sensor"
 CONF_AUTO_SUB_MODE_SENSOR = "auto_sub_mode_sensor"
+CONF_ERROR_CODE_SENSOR = "error_code_sensor"
+CONF_REMOTE_TEMP_SOURCE = "remote_temperature_source"
+CONF_REMOTE_TEMP_SOURCE_SENSOR_ID = "sensor_id"
+CONF_REMOTE_TEMP_SOURCE_INFO = "info"
 CONF_HP_UP_TIME_CONNECTION_SENSOR = "hp_uptime_connection_sensor"
 CONF_USE_AS_OPERATING_FALLBACK = "use_as_operating_fallback"  # Nouvelle constante
 CONF_FAHRENHEIT_SUPPORT_MODE = "fahrenheit_compatibility"
@@ -85,11 +110,16 @@ CONF_CIRCULATOR_SWITCH = "circulator_switch"
 CONF_HARDWARE_SETTINGS = "hardware_settings"
 CONF_CODE = "code"
 CONF_OPTIONS = "options"
+CONF_REMOTE_TEMPERATURE_CONTROL_SENSOR = "remote_temperature_control_sensor"
+#CONF_REMOTE_TEMPERATURE_MARGIN = "remote_temperature_margin"
+CONF_TEMPERATURE_MARGIN = "temperature_margin"
+CONF_POWER_UNIT_IS_BTU = "power_unit_is_btu"
 
 # Support explicite du DUAL setpoint via YAML
 CONF_DUAL_SETPOINT = "dual_setpoint"
+CONF_RESTORE_SETPOINTS = "restore_setpoints"
 
-DEFAULT_CLIMATE_MODES = ["AUTO", "COOL", "HEAT", "DRY", "FAN_ONLY"]
+DEFAULT_CLIMATE_MODES = ["AUTO", "COOL", "HEAT", "DRY", "FAN_ONLY", "HEAT_COOL"]
 DEFAULT_FAN_MODES = ["AUTO", "MIDDLE", "QUIET", "LOW", "MEDIUM", "HIGH"]
 DEFAULT_SWING_MODES = ["OFF", "VERTICAL", "HORIZONTAL", "BOTH"]
 
@@ -106,11 +136,12 @@ CN105Climate = cg.global_ns.class_(
     "CN105Climate", climate.Climate, cg.Component, uart.UARTDevice
 )
 CONF_REMOTE_TEMP_TIMEOUT = "remote_temperature_timeout"
+CONF_REMOTE_TEMP_KEEPALIVE_INTERVAL = "remote_temperature_keepalive_interval"
 CONF_DEBOUNCE_DELAY = "debounce_delay"
 CONF_CONNECTION_BOOTSTRAP_DELAY = "connection_bootstrap_delay"
 CONF_INSTALLER_MODE = "installer_mode"
 
-# Définitions des classes C++ (identiques à votre version)
+# DÃÂÃÂ©finitions des classes C++ (identiques ÃÂÃÂ  votre version)
 VaneOrientationSelect = cg.global_ns.class_(
     "VaneOrientationSelect", select.Select, cg.Component
 )
@@ -126,6 +157,9 @@ OutsideAirTemperatureSensor = cg.global_ns.class_(
     "OutsideAirTemperatureSensor", sensor.Sensor, cg.Component
 )
 ISeeSensor = cg.global_ns.class_("ISeeSensor", binary_sensor.BinarySensor, cg.Component)
+TargetHumiditySensor = cg.global_ns.class_(
+    "TargetHumiditySensor", sensor.Sensor, cg.Component
+)
 StageSensor = cg.global_ns.class_("StageSensor", text_sensor.TextSensor, cg.Component)
 FunctionsSensor = cg.global_ns.class_(
     "FunctionsSensor", text_sensor.TextSensor, cg.Component
@@ -136,8 +170,14 @@ SubModSensor = cg.global_ns.class_("SubModSensor", text_sensor.TextSensor, cg.Co
 AutoSubModSensor = cg.global_ns.class_(
     "AutoSubModSensor", text_sensor.TextSensor, cg.Component
 )
-uptime_ns = cg.esphome_ns.namespace("esphome").namespace("uptime")
-HpUpTimeConnectionSensor = uptime_ns.class_(
+ErrorCodeSensor = cg.global_ns.class_(
+    "ErrorCodeSensor", text_sensor.TextSensor, cg.Component
+)
+RemoteTempSourceInfo = cg.global_ns.class_(
+    "RemoteTempSourceInfo", text_sensor.TextSensor, cg.Component
+)
+cn105_ns = cg.esphome_ns.namespace("cn105")
+HpUpTimeConnectionSensor = cn105_ns.class_(
     "HpUpTimeConnectionSensor", sensor.Sensor, cg.PollingComponent
 )
 FlowControlSensor = cg.global_ns.class_(
@@ -149,7 +189,7 @@ HardwareSettingSelect = cg.global_ns.class_(
 )
 
 
-# --- Fonction d'aide pour récupérer les pins TX/RX (identique à votre version corrigée) ---
+# --- Fonction d'aide pour rÃÂÃÂ©cupÃÂÃÂ©rer les pins TX/RX (identique ÃÂÃÂ  votre version corrigÃÂÃÂ©e) ---
 def get_uart_pins_from_config(core_config, target_uart_id_str):
     tx_pin_num = -1
     rx_pin_num = -1
@@ -175,9 +215,9 @@ def get_uart_pins_from_config(core_config, target_uart_id_str):
 
 
 def get_uart_port_index(core_config, target_uart_id_str):
-    # ESPHome ne fournit pas directement l'index de contrôleur; on l'infère
-    # via l'ordre de déclaration ou restons à 0 par défaut.
-    # On tente d'associer l'objet id() à sa position.
+    # ESPHome ne fournit pas directement l'index de contrÃÂÃÂ´leur; on l'infÃÂÃÂ¨re
+    # via l'ordre de dÃÂÃÂ©claration ou restons ÃÂÃÂ  0 par dÃÂÃÂ©faut.
+    # On tente d'associer l'objet id() ÃÂÃÂ  sa position.
     idx = 0
     for i, uart_conf_item in enumerate(core_config.get("uart", [])):
         if str(uart_conf_item[CONF_ID]) == target_uart_id_str:
@@ -193,28 +233,56 @@ def get_uart_port_index(core_config, target_uart_id_str):
 
 # --- FIN de la fonction d'aide ---
 
-# Schémas pour les entités optionnelles (identiques à votre version)
+# SchÃÂÃÂ©mas pour les entitÃÂÃÂ©s optionnelles (identiques ÃÂÃÂ  votre version)
 SELECT_SCHEMA = select.select_schema(VaneOrientationSelect).extend(
     {cv.GenerateID(CONF_ID): cv.declare_id(VaneOrientationSelect)}
 )
 COMPRESSOR_FREQUENCY_SENSOR_SCHEMA = sensor.sensor_schema(
-    CompressorFrequencySensor
+    CompressorFrequencySensor,
+    unit_of_measurement=UNIT_HERTZ,
+    device_class=DEVICE_CLASS_FREQUENCY,
+    state_class=STATE_CLASS_MEASUREMENT,
+    accuracy_decimals=1,
 ).extend({cv.GenerateID(CONF_ID): cv.declare_id(CompressorFrequencySensor)})
-INPUT_POWER_SENSOR_SCHEMA = sensor.sensor_schema(InputPowerSensor).extend(
-    {cv.GenerateID(CONF_ID): cv.declare_id(InputPowerSensor)}
-)
-KWH_SENSOR_SCHEMA = sensor.sensor_schema(kWhSensor).extend(
-    {cv.GenerateID(CONF_ID): cv.declare_id(kWhSensor)}
-)
-RUNTIME_HOURS_SENSOR_SCHEMA = sensor.sensor_schema(RuntimeHoursSensor).extend(
-    {cv.GenerateID(CONF_ID): cv.declare_id(RuntimeHoursSensor)}
-)
+INPUT_POWER_SENSOR_SCHEMA = sensor.sensor_schema(
+    InputPowerSensor,
+    unit_of_measurement=UNIT_WATT,
+    device_class=DEVICE_CLASS_POWER,
+    state_class=STATE_CLASS_MEASUREMENT,
+    accuracy_decimals=0,
+).extend({cv.GenerateID(CONF_ID): cv.declare_id(InputPowerSensor)})
+KWH_SENSOR_SCHEMA = sensor.sensor_schema(
+    kWhSensor,
+    unit_of_measurement=UNIT_KILOWATT_HOURS,
+    device_class=DEVICE_CLASS_ENERGY,
+    state_class=STATE_CLASS_TOTAL_INCREASING,
+    accuracy_decimals=1,
+).extend({cv.GenerateID(CONF_ID): cv.declare_id(kWhSensor)})
+RUNTIME_HOURS_SENSOR_SCHEMA = sensor.sensor_schema(
+    RuntimeHoursSensor,
+    unit_of_measurement=UNIT_HOUR,
+    device_class=DEVICE_CLASS_DURATION,
+    state_class=STATE_CLASS_TOTAL_INCREASING,
+    accuracy_decimals=2,
+).extend({cv.GenerateID(CONF_ID): cv.declare_id(RuntimeHoursSensor)})
 OUTSIDE_AIR_TEMPERATURE_SENSOR_SCHEMA = sensor.sensor_schema(
-    OutsideAirTemperatureSensor
+    OutsideAirTemperatureSensor,
+    unit_of_measurement=UNIT_CELSIUS,
+    device_class=DEVICE_CLASS_TEMPERATURE,
+    state_class=STATE_CLASS_MEASUREMENT,
+    accuracy_decimals=1,
 ).extend({cv.GenerateID(CONF_ID): cv.declare_id(OutsideAirTemperatureSensor)})
 ISEE_SENSOR_SCHEMA = binary_sensor.binary_sensor_schema(ISeeSensor).extend(
     {cv.GenerateID(CONF_ID): cv.declare_id(ISeeSensor)}
 )
+TARGET_HUMIDITY_SENSOR_SCHEMA = sensor.sensor_schema(
+    TargetHumiditySensor,
+    unit_of_measurement="%",
+    icon="mdi:water-percent",
+    state_class=STATE_CLASS_MEASUREMENT,
+    accuracy_decimals=0,
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+).extend({cv.GenerateID(CONF_ID): cv.declare_id(TargetHumiditySensor)})
 FUNCTIONS_SENSOR_SCHEMA = text_sensor.text_sensor_schema(FunctionsSensor).extend(
     {cv.GenerateID(CONF_ID): cv.declare_id(FunctionsSensor)}
 )
@@ -231,15 +299,40 @@ AUTO_SUB_MODE_SENSOR_SCHEMA = text_sensor.text_sensor_schema(AutoSubModSensor).e
     {cv.GenerateID(CONF_ID): cv.declare_id(AutoSubModSensor)}
 )
 
-# Schéma pour STAGE_SENSOR (qui est un text_sensor) AVEC la nouvelle sous-option
+ERROR_CODE_SENSOR_SCHEMA = text_sensor.text_sensor_schema(ErrorCodeSensor).extend(
+    {cv.GenerateID(CONF_ID): cv.declare_id(ErrorCodeSensor)}
+)
+
+REMOTE_TEMP_SOURCE_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_REMOTE_TEMP_SOURCE_SENSOR_ID): cv.use_id(sensor.Sensor),
+        cv.Optional(CONF_REMOTE_TEMP_SOURCE_INFO): text_sensor.text_sensor_schema(RemoteTempSourceInfo).extend(
+            {cv.GenerateID(CONF_ID): cv.declare_id(RemoteTempSourceInfo)}
+        ),
+    }
+)
+
+REMOTE_TEMPERATURE_CONTROL_SENSOR_SCHEMA = binary_sensor.binary_sensor_schema(
+    binary_sensor.BinarySensor,
+    device_class="connectivity",
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+    icon="mdi:thermometer-check",
+).extend(
+    {
+        cv.GenerateID(CONF_ID): cv.declare_id(binary_sensor.BinarySensor),
+        cv.Optional(CONF_TEMPERATURE_MARGIN, default=0.4): cv.positive_float,
+    }
+)
+
+# SchÃÂÃÂ©ma pour STAGE_SENSOR (qui est un text_sensor) AVEC la nouvelle sous-option
 STAGE_SENSOR_CONFIG_SCHEMA = text_sensor.text_sensor_schema(StageSensor).extend(
     {
-        # L'ID pour l'objet StageSensor C++ est géré par text_sensor.TEXT_SENSOR_SCHEMA (via CONF_ID)
+        # L'ID pour l'objet StageSensor C++ est gÃÂÃÂ©rÃÂÃÂ© par text_sensor.TEXT_SENSOR_SCHEMA (via CONF_ID)
         cv.Optional(CONF_USE_AS_OPERATING_FALLBACK, default=False): cv.boolean,
     }
 )
 
-# Schéma pour HP_UP_TIME_CONNECTION_SENSOR (identique à votre version)
+# SchÃÂÃÂ©ma pour HP_UP_TIME_CONNECTION_SENSOR (identique ÃÂÃÂ  votre version)
 HP_UP_TIME_CONNECTION_SENSOR_SCHEMA = sensor.sensor_schema(
     HpUpTimeConnectionSensor,
     unit_of_measurement=UNIT_SECOND,
@@ -298,6 +391,7 @@ CONFIG_SCHEMA = (
                 CONF_OUTSIDE_AIR_TEMPERATURE_SENSOR
             ): OUTSIDE_AIR_TEMPERATURE_SENSOR_SCHEMA,
             cv.Optional(CONF_ISEE_SENSOR): ISEE_SENSOR_SCHEMA,
+            cv.Optional(CONF_TARGET_HUMIDITY_SENSOR): TARGET_HUMIDITY_SENSOR_SCHEMA,
             cv.Optional(CONF_FUNCTIONS_SENSOR): FUNCTIONS_SENSOR_SCHEMA,
             cv.Optional(CONF_FUNCTIONS_BUTTON): FUNCTIONS_BUTTON_SCHEMA,
             cv.Optional(CONF_FUNCTIONS_SET_BUTTON): FUNCTIONS_BUTTON_SCHEMA,
@@ -308,10 +402,17 @@ CONFIG_SCHEMA = (
             ),
             cv.Optional(
                 CONF_STAGE_SENSOR
-            ): STAGE_SENSOR_CONFIG_SCHEMA,  # Modifié pour le nouveau schéma
+            ): STAGE_SENSOR_CONFIG_SCHEMA,  # ModifiÃÂÃÂ© pour le nouveau schÃÂÃÂ©ma
             cv.Optional(CONF_SUB_MODE_SENSOR): SUB_MODE_SENSOR_SCHEMA,
             cv.Optional(CONF_AUTO_SUB_MODE_SENSOR): AUTO_SUB_MODE_SENSOR_SCHEMA,
+            cv.Optional(CONF_ERROR_CODE_SENSOR): ERROR_CODE_SENSOR_SCHEMA,
+            cv.Optional(CONF_REMOTE_TEMP_SOURCE): REMOTE_TEMP_SOURCE_SCHEMA,
             cv.Optional(CONF_REMOTE_TEMP_TIMEOUT, default="never"): cv.All(
+                cv.update_interval
+            ),
+            # Keep-alive interval for remote temperature (like Kumo does every ~20s)
+            # Set to 0s to disable keep-alive
+            cv.Optional(CONF_REMOTE_TEMP_KEEPALIVE_INTERVAL, default="20s"): cv.All(
                 cv.update_interval
             ),
             cv.Optional(CONF_DEBOUNCE_DELAY, default="100ms"): cv.All(
@@ -329,6 +430,11 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_NIGHT_MODE_SWITCH): HVAC_OPTION_SWITCH_SCHEMA,
             cv.Optional(CONF_CIRCULATOR_SWITCH): HVAC_OPTION_SWITCH_SCHEMA,
             cv.Optional(CONF_HARDWARE_SETTINGS): HARDWARE_SETTING_SCHEMA,
+            cv.Optional(
+                CONF_REMOTE_TEMPERATURE_CONTROL_SENSOR
+            ): REMOTE_TEMPERATURE_CONTROL_SENSOR_SCHEMA,
+            #cv.Optional(CONF_REMOTE_TEMPERATURE_MARGIN, default=0.4): cv.positive_float,
+            cv.Optional(CONF_POWER_UNIT_IS_BTU, default=False): cv.boolean,
             cv.Optional(CONF_SUPPORTS, default={}): cv.Schema(
                 {
                     cv.Optional(
@@ -341,8 +447,15 @@ CONFIG_SCHEMA = (
                         CONF_SWING_MODE, default=DEFAULT_SWING_MODES
                     ): cv.ensure_list(climate.validate_climate_swing_mode),
                     cv.Optional(CONF_DUAL_SETPOINT, default=False): cv.boolean,
+                    cv.Optional(CONF_RESTORE_SETPOINTS, default=False): cv.boolean,
                     cv.Optional(CONF_SUPPORTS_HORIZONTAL_VANE_MODE): cv.ensure_list(
                         cv.string
+                    ),
+                    cv.Optional(CONF_HORIZONTAL_VANES, default=1): cv.int_range(
+                        min=1, max=2
+                    ),
+                    cv.Optional(CONF_VANE_TYPE, default="standard"): cv.enum(
+                        VANE_TYPES, lower=True
                     ),
                 }
             ),
@@ -359,6 +472,7 @@ def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID], uart_var)
 
     cg.add(var.set_installer_mode(config[CONF_INSTALLER_MODE]))
+    cg.add(var.set_power_unit_is_btu(config[CONF_POWER_UNIT_IS_BTU]))
 
     cg.add(uart_var.set_data_bits(8))
     cg.add(uart_var.set_parity(UARTParityOptions.UART_CONFIG_PARITY_EVEN))
@@ -377,29 +491,51 @@ def to_code(config):
         supports = config[CONF_SUPPORTS]
         traits = var.config_traits()
 
-        # Configurer les modes supportés
+        # Configurer les modes supportÃÂÃÂ©s
         supported_modes = supports.get(CONF_MODE, DEFAULT_CLIMATE_MODES)
         for mode_str in supported_modes:
             if mode_str == "OFF":
                 continue
             if mode_str in climate.CLIMATE_MODES:
                 cg.add(traits.add_supported_mode(climate.CLIMATE_MODES[mode_str]))
+            # Handle mapping for HA HEAT_COOL -> Mitsu AUTO without replacing the real AUTO
+            if mode_str == "HEAT_COOL" and "HEAT_COOL" in climate.CLIMATE_MODES:
+                cg.add(traits.add_supported_mode(climate.CLIMATE_MODES["HEAT_COOL"]))
 
         # Configure the horizontal vane options
         horizontal_vane_options = supports.get(CONF_SUPPORTS_HORIZONTAL_VANE_MODE, [])
 
-        # Définir le support du dual setpoint via YAML (par défaut: False si absent)
+        # Set the number of horizontal vanes (Legacy)
+        cg.add(var.set_horizontal_vanes(supports.get(CONF_HORIZONTAL_VANES, 1)))
+        
+        # Set vane type (New)
+        vane_type_conf = supports.get(CONF_VANE_TYPE, "standard")
+        vane_type_val = VANE_TYPES.get(vane_type_conf, 0)
+        vane_type_enum = cg.RawExpression(
+            f"static_cast<esphome::CN105Climate::VaneType>({vane_type_val})"
+        )
+        cg.add(var.set_vane_type(vane_type_enum))
+
+        # Set dual setpoint support via YAML (default: False if missing)
+        # Note: this enables global dual setpoint support in HA.
         yaml_dual = supports.get(CONF_DUAL_SETPOINT, False)
-        # Utilise directement la constante C++ via une RawExpression pour éviter d'aller la chercher côté Python
+
+        # Use the C++ constant directly via RawExpression
         dual_flag = cg.RawExpression(
             "climate::CLIMATE_REQUIRES_TWO_POINT_TARGET_TEMPERATURE"
         )
+
         if yaml_dual:
-            # Active le flag de dual setpoint via l'API de feature flags (remplace l'appel déprécié)
             cg.add(traits.add_feature_flags(dual_flag))
-        else:
-            # S'assure que le flag est désactivé si l'option YAML est à False
-            cg.add(traits.clear_feature_flags(dual_flag))
+
+        # Note: If yaml_dual is False, we simply do NOT add the dual_flag.
+
+        # Opt-in: persist the HEAT_COOL band (mode + low/high) to flash and restore
+        # it on boot, so a reboot/OTA doesn't drop the unit back to hardware AUTO.
+        cg.add(var.set_restore_setpoints(supports.get(CONF_RESTORE_SETPOINTS, False)))
+        # ESPHome's default behavior for modes like COOL/HEAT is to enable single-point target temperature.
+        # We don't need to explicitly force single-point or clear the dual flag (it's off by default).
+
         for fan_mode_str in supports.get(CONF_FAN_MODE, DEFAULT_FAN_MODES):
             if fan_mode_str in climate.CLIMATE_FAN_MODES:
                 cg.add(
@@ -418,12 +554,17 @@ def to_code(config):
     cg.add(var.set_remote_temp_timeout(config[CONF_REMOTE_TEMP_TIMEOUT]))
     cg.add(var.set_debounce_delay(config[CONF_DEBOUNCE_DELAY]))
     cg.add(
+        var.set_remote_temp_keepalive_interval(
+            int(config[CONF_REMOTE_TEMP_KEEPALIVE_INTERVAL].total_milliseconds)
+        )
+    )
+    cg.add(
         var.set_connection_bootstrap_delay(
             int(config[CONF_CONNECTION_BOOTSTRAP_DELAY].total_milliseconds)
         )
     )
 
-    # --- Configuration des entités optionnelles (style original) ---
+    # --- Configuration des entitÃÂÃÂ©s optionnelles (style original) ---
     if CONF_HORIZONTAL_SWING_SELECT in config:
         conf_item = config[CONF_HORIZONTAL_SWING_SELECT]
         # new_select s'occupe de l'enregistrement. options=[] est important.
@@ -448,15 +589,15 @@ def to_code(config):
         control_select_var = yield select.new_select(conf_item, options=[])
         cg.add(var.set_airflow_control_select(control_select_var))
 
-    # Pour les capteurs, text_sensors, etc., utiliser la méthode .new_... standard
+    # Pour les capteurs, text_sensors, etc., utiliser la mÃÂÃÂ©thode .new_... standard
     # Ces fonctions s'occupent de l'enregistrement du composant.
     if CONF_COMPRESSOR_FREQUENCY_SENSOR in config:
-        # conf = config[CONF_COMPRESSOR_FREQUENCY_SENSOR] # 'conf' est déjà utilisé comme argument de to_code
-        # conf["force_update"] = False # Ceci était dans votre code original, le garder si pertinent
+        # conf = config[CONF_COMPRESSOR_FREQUENCY_SENSOR] # 'conf' est dÃÂÃÂ©jÃÂÃÂ  utilisÃÂÃÂ© comme argument de to_code
+        # conf["force_update"] = False # Ceci ÃÂÃÂ©tait dans votre code original, le garder si pertinent
         conf_item = config[CONF_COMPRESSOR_FREQUENCY_SENSOR]
         if (
             "force_update" not in conf_item
-        ):  # S'assurer de ne pas l'écraser si l'user l'a mis
+        ):  # S'assurer de ne pas l'ÃÂÃÂ©craser si l'user l'a mis
             conf_item["force_update"] = False
         sensor_var = yield sensor.new_sensor(conf_item)
         cg.add(var.set_compressor_frequency_sensor(sensor_var))
@@ -492,6 +633,13 @@ def to_code(config):
     if CONF_ISEE_SENSOR in config:
         bsensor_var = yield binary_sensor.new_binary_sensor(config[CONF_ISEE_SENSOR])
         cg.add(var.set_isee_sensor(bsensor_var))
+
+    if CONF_TARGET_HUMIDITY_SENSOR in config:
+        conf_item = config[CONF_TARGET_HUMIDITY_SENSOR]
+        if "force_update" not in conf_item:
+            conf_item["force_update"] = False
+        sensor_var = yield sensor.new_sensor(conf_item)
+        cg.add(var.set_target_humidity_sensor(sensor_var))
 
     if CONF_FUNCTIONS_SENSOR in config:
         tsensor_var = yield text_sensor.new_text_sensor(config[CONF_FUNCTIONS_SENSOR])
@@ -535,14 +683,20 @@ def to_code(config):
     # The enum validator returns the integer value from FAHRENHEIT_MODES dict
     fahrenheit_mode = config.get(CONF_FAHRENHEIT_SUPPORT_MODE)
     # Ensure it's an integer (enum validator should already return int, but be explicit)
-    fahrenheit_value = int(fahrenheit_mode) if isinstance(fahrenheit_mode, int) else FAHRENHEIT_MODES.get(str(fahrenheit_mode).lower(), 0)
-    mode_enum = cg.RawExpression(f"static_cast<esphome::FahrenheitMode>({fahrenheit_value})")
+    fahrenheit_value = (
+        int(fahrenheit_mode)
+        if isinstance(fahrenheit_mode, int)
+        else FAHRENHEIT_MODES.get(str(fahrenheit_mode).lower(), 0)
+    )
+    mode_enum = cg.RawExpression(
+        f"static_cast<esphome::FahrenheitMode>({fahrenheit_value})"
+    )
     cg.add(var.set_use_fahrenheit_support_mode(mode_enum))
 
     # --- TRAITEMENT POUR STAGE_SENSOR AVEC LA NOUVELLE OPTION ---
     if CONF_STAGE_SENSOR in config:
         conf_stage_dict = config[CONF_STAGE_SENSOR]
-        # new_text_sensor gère la création et l'enregistrement de base du text_sensor
+        # new_text_sensor gÃÂÃÂ¨re la crÃÂÃÂ©ation et l'enregistrement de base du text_sensor
         stage_ts_var = yield text_sensor.new_text_sensor(conf_stage_dict)
         cg.add(var.set_stage_sensor(stage_ts_var))
 
@@ -550,6 +704,16 @@ def to_code(config):
         if conf_stage_dict.get(CONF_USE_AS_OPERATING_FALLBACK, False):
             cg.add(var.set_use_stage_for_operating_status(True))
     # --- FIN DU TRAITEMENT POUR STAGE_SENSOR ---
+
+    if CONF_REMOTE_TEMPERATURE_CONTROL_SENSOR in config:
+        conf = config[CONF_REMOTE_TEMPERATURE_CONTROL_SENSOR]
+        sensor_var = yield binary_sensor.new_binary_sensor(conf)
+        cg.add(var.set_remote_temperature_control_sensor(sensor_var))
+        if CONF_TEMPERATURE_MARGIN in conf:
+            cg.add(var.set_remote_temperature_margin(conf[CONF_TEMPERATURE_MARGIN]))
+
+    #if CONF_REMOTE_TEMPERATURE_MARGIN in config:
+    #    cg.add(var.set_remote_temperature_margin(config[CONF_REMOTE_TEMPERATURE_MARGIN]))
 
     if CONF_SUB_MODE_SENSOR in config:
         tsensor_var = yield text_sensor.new_text_sensor(config[CONF_SUB_MODE_SENSOR])
@@ -560,6 +724,20 @@ def to_code(config):
             config[CONF_AUTO_SUB_MODE_SENSOR]
         )
         cg.add(var.set_auto_sub_mode_sensor(tsensor_var))
+
+    if CONF_ERROR_CODE_SENSOR in config:
+        tsensor_var = yield text_sensor.new_text_sensor(
+            config[CONF_ERROR_CODE_SENSOR]
+        )
+        cg.add(var.set_error_code_sensor(tsensor_var))
+
+    if CONF_REMOTE_TEMP_SOURCE in config:
+        rts_config = config[CONF_REMOTE_TEMP_SOURCE]
+        source_sensor = yield cg.get_variable(rts_config[CONF_REMOTE_TEMP_SOURCE_SENSOR_ID])
+        cg.add(var.set_remote_temp_source(source_sensor))
+        if CONF_REMOTE_TEMP_SOURCE_INFO in rts_config:
+            info_sensor = yield text_sensor.new_text_sensor(rts_config[CONF_REMOTE_TEMP_SOURCE_INFO])
+            cg.add(var.set_remote_temp_source_info_sensor(info_sensor))
 
     if CONF_HP_UP_TIME_CONNECTION_SENSOR in config:
         conf = config[CONF_HP_UP_TIME_CONNECTION_SENSOR]

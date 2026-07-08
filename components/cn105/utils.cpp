@@ -1,6 +1,7 @@
 #include "cn105.h"
 #include "Globals.h"
 #include <math.h>
+#include <memory>
 
 using namespace esphome;
 
@@ -44,12 +45,48 @@ const char* CN105Climate::getIfNotNull(const char* what, const char* defaultValu
  * It returns the temperature setting.
  */
 float CN105Climate::calculateTemperatureSetting(float setting) {
-    if (!this->tempMode) {
-        return this->lookupByteMapIndex(TEMP_MAP, 16, (int)(setting + 0.5)) > -1 ? setting : TEMP_MAP[0];
+    if (!this->use_temperature_encoding_b_) {
+        return cn105_protocol::lookup_index(TEMP_MAP, 16, (int)(setting + 0.5)) > -1 ? setting : TEMP_MAP[0];
     } else {
         setting = std::round(2.0f * setting) / 2.0f;  // Round to the nearest half-degree.
         return setting < 10 ? 10 : (setting > 31 ? 31 : setting);
     }
+}
+
+/**
+ * Convert raw input power value to Watts.
+ *
+ * By default (power_unit_is_btu_ = false) the CN105 protocol already sends
+ * the value in native Watts, so no conversion is needed (identity).
+ *
+ * Set `power_unit_is_btu: true` in YAML for units (e.g. some MSZ-LN models)
+ * whose firmware encodes the value in BTU/s instead. In that case the
+ * conversion factor is: 1 W = 1 J/s, 1 BTU = 1055.056 J
+ *   => raw [BTU/s] * (3600 / 1055.056) = Watts
+ */
+float CN105Climate::convert_input_power_to_W(float raw_input_power) {
+    if (power_unit_is_btu_) {
+        static constexpr float conv_factor = 3600.0f / 1055.05558262f;
+        return raw_input_power * conv_factor;
+    }
+    return raw_input_power;  // already in Watts
+}
+
+/**
+ * Convert the raw energy usage value to kWh.
+ *
+ * By default (power_unit_is_btu_ = false) the protocol encodes energy as
+ * kWh * 10, so we simply divide by 10.
+ *
+ * Set `power_unit_is_btu: true` for units that encode in kBTU instead:
+ *   => raw [kBTU] * (1055.056 / 3 600 000) * 1000 = kWh
+ */
+float CN105Climate::convert_energy_usage_to_kWh(float raw_energy_usage) {
+    if (power_unit_is_btu_) {
+        static constexpr float conv_factor = 1055.05585262f / 3600000.0f;
+        return 1000.0f * raw_energy_usage * conv_factor;
+    }
+    return raw_energy_usage / 10.0f;  // already in kWh/10
 }
 
 /**
@@ -76,8 +113,14 @@ void CN105Climate::updateTargetTemperaturesFromSettings(float temperature) {
             if (std::isnan(this->getTargetTemperatureLow())) {
                 this->setTargetTemperatureLow(temperature);
             }
-        } else if (this->mode == climate::CLIMATE_MODE_AUTO) {
-            // En AUTO: si les deux bornes existent déjà, ne pas recentrer
+        } else if (this->mode == climate::CLIMATE_MODE_AUTO || this->mode == climate::CLIMATE_MODE_HEAT_COOL) {
+            // En AUTO/HEAT_COOL: si les deux bornes existent déjà, ne pas recentrer.
+            // In HEAT_COOL the transmitted setpoint is the deadband output
+            // clamp(current, low, high) — it carries no information about the
+            // band, so reconstructing the band from it corrupts the user's
+            // setpoints (issue #673: with fahrenheit_compatibility the
+            // non-idempotent table round-trip ratchets the band +0.5°C per
+            // pass until it parks 1.0°C above the requested values).
             bool lowDefined = !std::isnan(this->getTargetTemperatureLow());
             bool highDefined = !std::isnan(this->getTargetTemperatureHigh());
 
@@ -327,30 +370,91 @@ void CN105Climate::debugSettingsAndStatus(const char* settingName, heatpumpSetti
 
 
 
-void CN105Climate::hpPacketDebug(uint8_t* packet, unsigned int length, const char* packetDirection) {
-    // Construire la chaîne de sortie de façon sûre et performante
-    std::string output;
-    output.reserve(length * 3 + 1); // "FF " par octet
+void CN105Climate::hpPacketDebug(const uint8_t* packet, unsigned int length, const char* packetDirection, const char* log_prefix) {
+    if (length < 5) {
+        // Fallback for too short packets
+        std::string output;
+        char byteBuf[4];
+        for (unsigned int i = 0; i < length; i++) {
+            snprintf(byteBuf, sizeof(byteBuf), "%02X ", packet[i]);
+            output += byteBuf;
+        }
+        ESP_LOGD(packetDirection, "SHORT: %s", output.c_str());
+        return;
+    }
 
-    char byteBuf[4];
-    for (unsigned int i = 0; i < length; i++) {
-        // Toujours borné à 3 caractères + NUL
-        int written = snprintf(byteBuf, sizeof(byteBuf), "%02X ", packet[i]);
-        if (written > 0) {
-            output.append(byteBuf, static_cast<size_t>(written));
+    // Determine packet type label
+    const char* label = "UNKNOWN";
+    if (packet[0] == 0xFC) {
+        switch (packet[1]) {
+        case 0x5A: label = "CONNECT"; break;
+        case 0x5B: label = "CONN_INST"; break; // Installer mode
+        case 0x41: label = "SET"; break;       // Command sent to HP
+        case 0x42: label = "ACK/INFO"; break;  // Response/Info from HP
+        case 0x61: label = "GET"; break;       // Request data from HP
+        case 0x62: label = "RESPONSE"; break;  // Data response from HP
         }
     }
 
-    char outputForSensor[15];
-    // Tronquer proprement pour la publication éventuelle sur un capteur
-    strncpy(outputForSensor, output.c_str(), sizeof(outputForSensor) - 1);
-    outputForSensor[sizeof(outputForSensor) - 1] = '\0';
+    // Determine specific command/data type (Semantic decoding)
+    // Byte 5 (index 5) is usually the subcommand
+    const char* subLabel = "";
+    if (length > 5) {
+        switch (packet[5]) {
+        case 0x01: subLabel = ":Start"; break; // Or "Connect" ?
+        case 0x02: subLabel = ":Settings"; break;
+        case 0x03: subLabel = ":RoomTemp"; break;
+        case 0x04: subLabel = ":Status"; break; // Or "Unknown"? 0x04 is RQST_PKT_STATUS in cn105_types.h
+        case 0x05: subLabel = ":Standby"; break; // RQST_PKT_STANDBY
+        case 0x06: subLabel = ":Status"; break;  // RQST_PKT_HVAC_OPTIONS? Wait, need to check types map.
+                                                 // In cn105_types: 0x06 is RQST_PKT_HVAC_OPTIONS? 
+                                                 // Actually 0x06 in RCVD_PKT is TIMER? 
+                                                 // Let's stick to common ones seen in logs:
+                                                 // 02=Settings, 03=RoomTemp, 06=Status/Timers?, 09=Power?
+                                                 // 0x09 is RCVD_PKT_STATUS in some contexts or Power?
+                                                 // Looking at logs:
+                                                 // FC 62 ... 09 ... -> Power/Standby?
+                                                 // FC 62 ... 06 ... -> Status?
+        case 0x09: subLabel = ":Power"; break;
+        case 0x10: subLabel = ":Hello"; break; // Connect response 
+        case 0x20: subLabel = ":Func1"; break; // Functions part 1
+        case 0x22: subLabel = ":Func2"; break; // Functions part 2
+        }
+    }
+    
+    // For 0x06 specifically, in many logs it's Status or Timers. 
+    // In types.h: RCVD_PKT_STATUS = 5, RCVD_PKT_TIMER = 6.
+    // Let's use generic names if unsure, but user wants semantic.
+    if (packet[5] == 0x06) subLabel = ":Status"; 
+    
+    char fullLabel[20];
+    snprintf(fullLabel, sizeof(fullLabel), "%s%s", label, subLabel);
 
-    /*if (strcasecmp(packetDirection, "WRITE") == 0) {
-        this->last_sent_packet_sensor->publish_state(outputForSensor);
-    }*/
+    // Format strings
+    std::string headerStr, dataStr, csStr;
+    char byteBuf[4];
 
-    ESP_LOGD(packetDirection, "%s", output.c_str());
+    // HEADER: First 5 bytes
+    for (unsigned int i = 0; i < 5 && i < length; i++) {
+        snprintf(byteBuf, sizeof(byteBuf), "%02X ", packet[i]);
+        headerStr += byteBuf;
+    }
+
+    // DATA: Bytes 5 to Length-2 (payload)
+    if (length > 6) {
+        for (unsigned int i = 5; i < length - 1; i++) {
+            snprintf(byteBuf, sizeof(byteBuf), "%02X ", packet[i]);
+            dataStr += byteBuf;
+        }
+    }
+
+    // CHECKSUM: Last byte
+    snprintf(byteBuf, sizeof(byteBuf), "%02X", packet[length - 1]);
+    csStr = byteBuf;
+
+// Output format: [LABEL:SubLabel ] HEADER -> [ PAYLOAD ] CS
+    ESP_LOGD(packetDirection, "%s|%s|->[%s](%s) <%s>", 
+        log_prefix, headerStr.c_str(), dataStr.c_str(), csStr.c_str(), fullLabel);
 }
 
 void CN105Climate::hpFunctionsDebug(uint8_t* packet, unsigned int length) {
@@ -380,48 +484,43 @@ void CN105Climate::hpFunctionsDebug(uint8_t* packet, unsigned int length) {
 }
 
 int CN105Climate::lookupByteMapIndex(const int valuesMap[], int len, int lookupValue, const char* debugInfo) {
-    for (int i = 0; i < len; i++) {
-        if (valuesMap[i] == lookupValue) {
-            return i;
-        }
+    int idx = cn105_protocol::lookup_index(valuesMap, len, lookupValue);
+    if (idx < 0) {
+        ESP_LOGW("lookup", "%s caution value %d not found, returning -1", debugInfo, lookupValue);
     }
-    ESP_LOGW("lookup", "%s caution value %d not found, returning -1", debugInfo, lookupValue);
-    //esphome::delay(200);
-    return -1;
+    return idx;
 }
 int CN105Climate::lookupByteMapIndex(const char* valuesMap[], int len, const char* lookupValue, const char* debugInfo) {
-    for (int i = 0; i < len; i++) {
-        if (strcasecmp(valuesMap[i], lookupValue) == 0) {
-            return i;
-        }
+    int idx = cn105_protocol::lookup_index(valuesMap, len, lookupValue);
+    if (idx < 0) {
+        ESP_LOGW("lookup", "%s caution value %s not found, returning -1", debugInfo, lookupValue);
     }
-    ESP_LOGW("lookup", "%s caution value %s not found, returning -1", debugInfo, lookupValue);
-    //esphome::delay(200);
-    return -1;
+    return idx;
 }
 const char* CN105Climate::lookupByteMapValue(const char* valuesMap[], const uint8_t byteMap[], int len, uint8_t byteValue, const char* debugInfo, const char* defaultValue) {
+    // Check if value exists in the map first
     for (int i = 0; i < len; i++) {
         if (byteMap[i] == byteValue) {
             return valuesMap[i];
         }
     }
-
     if (defaultValue != nullptr) {
         return defaultValue;
-    } else {
-        ESP_LOGW("lookup", "%s caution: value %d not found, returning value at index 0", debugInfo, byteValue);
-        return valuesMap[0];
-    }
-
-}
-int CN105Climate::lookupByteMapValue(const int valuesMap[], const uint8_t byteMap[], int len, uint8_t byteValue, const char* debugInfo) {
-    for (int i = 0; i < len; i++) {
-        if (byteMap[i] == byteValue) {
-            return valuesMap[i];
-        }
     }
     ESP_LOGW("lookup", "%s caution: value %d not found, returning value at index 0", debugInfo, byteValue);
     return valuesMap[0];
+}
+int CN105Climate::lookupByteMapValue(const int valuesMap[], const uint8_t byteMap[], int len, uint8_t byteValue, const char* debugInfo) {
+    int result = cn105_protocol::lookup_value(valuesMap, byteMap, len, byteValue);
+    // Check if the lookup actually found a match vs returned fallback
+    bool found = false;
+    for (int i = 0; i < len; i++) {
+        if (byteMap[i] == byteValue) { found = true; break; }
+    }
+    if (!found) {
+        ESP_LOGW("lookup", "%s caution: value %d not found, returning value at index 0", debugInfo, byteValue);
+    }
+    return result;
 }
 
 #ifndef USE_ESP32
@@ -430,50 +529,70 @@ int CN105Climate::lookupByteMapValue(const int valuesMap[], const uint8_t byteMa
  *
 */
 void CN105Climate::emulateMutex(const char* retryName, std::function<void()>&& f) {
-    this->set_retry(retryName, 100, 10, [this, f, retryName](uint8_t retry_count) {
+    auto callback = std::make_shared<std::function<void()>>(std::move(f));
+    auto retry = std::make_shared<std::function<void(uint8_t, uint32_t)>>();
+    std::weak_ptr<std::function<void(uint8_t, uint32_t)>> weak_retry = retry;
+    *retry = [this, retryName, weak_retry, callback](uint8_t retry_count, uint32_t delay_ms) {
         if (this->wantedSettingsMutex) {
-            if (retry_count < 1) {
+            if (retry_count >= 10) {
                 ESP_LOGW(retryName, "10 retry calls failed because mutex was locked, forcing unlock...");
                 this->wantedSettingsMutex = true;
-                f();
+                (*callback)();
                 this->wantedSettingsMutex = false;
-                return RetryResult::DONE;
+                return;
             }
             ESP_LOGI(retryName, "wantedSettingsMutex is already locked, defferring...");
-            return RetryResult::RETRY;
+            const uint32_t next_delay_ms = static_cast<uint32_t>(delay_ms * 1.2f);
+            if (auto retry = weak_retry.lock()) {
+                this->set_timeout(retryName, delay_ms, [retry, retry_count, next_delay_ms]() {
+                    (*retry)(retry_count + 1, next_delay_ms);
+                });
+            }
+            return;
         } else {
             this->wantedSettingsMutex = true;
             ESP_LOGD(retryName, "emulateMutex normal behaviour, locking...");
-            f();
+            (*callback)();
             ESP_LOGD(retryName, "emulateMutex unlocking...");
             this->wantedSettingsMutex = false;
-            return RetryResult::DONE;
+            return;
         }
-        }, 1.2f);
+    };
+    (*retry)(0, 100);
 }
 #ifdef TEST_MODE
 
 void CN105Climate::testEmulateMutex(const char* retryName, std::function<void()>&& f) {
-    this->set_retry(retryName, 100, 10, [this, f, retryName](uint8_t retry_count) {
+    auto callback = std::make_shared<std::function<void()>>(std::move(f));
+    auto retry = std::make_shared<std::function<void(uint8_t, uint32_t)>>();
+    std::weak_ptr<std::function<void(uint8_t, uint32_t)>> weak_retry = retry;
+    *retry = [this, retryName, weak_retry, callback](uint8_t retry_count, uint32_t delay_ms) {
         if (this->esp8266Mutex) {
-            if (retry_count < 1) {
+            if (retry_count >= 10) {
                 ESP_LOGW(retryName, "10 retry calls failed because mutex was locked, forcing unlock...");
                 this->esp8266Mutex = true;
-                f();
+                (*callback)();
                 this->esp8266Mutex = false;
-                return RetryResult::DONE;
+                return;
             }
             ESP_LOGI(retryName, "testMutex is already locked, defferring...");
-            return RetryResult::RETRY;
+            const uint32_t next_delay_ms = static_cast<uint32_t>(delay_ms * 1.2f);
+            if (auto retry = weak_retry.lock()) {
+                this->set_timeout(retryName, delay_ms, [retry, retry_count, next_delay_ms]() {
+                    (*retry)(retry_count + 1, next_delay_ms);
+                });
+            }
+            return;
         } else {
             this->esp8266Mutex = true;
             ESP_LOGD(retryName, "emulateMutex normal behaviour, locking...");
-            f();
+            (*callback)();
             ESP_LOGD(retryName, "emulateMutex unlocking...");
             this->esp8266Mutex = false;
-            return RetryResult::DONE;
+            return;
         }
-        }, 1.2f);
+    };
+    (*retry)(0, 100);
 }
 #endif
 #endif

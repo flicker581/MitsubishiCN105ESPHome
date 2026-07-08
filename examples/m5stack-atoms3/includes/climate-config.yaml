@@ -7,7 +7,7 @@
 external_components:
  - source:
      type: local
-     path: ../../../components 
+     path: ../../components 
 
 uart:
   id: HP_UART
@@ -35,6 +35,8 @@ climate:
     #  name: ${name} Outside air temperature
     vertical_vane_select:
       name: Orientation de la Vane Verticale
+    target_humidity_sensor:
+      name: "Target Humidity"
     #horizontal_vane_select:
     #  name: Orientation de la Vane Horizontale
     #isee_sensor:
@@ -45,9 +47,14 @@ climate:
       name: submode sensor
     stage_sensor:
       name: stage sensor
+    error_code_sensor:
+      name: error code
+    remote_temperature_source:
+      sensor_id: ha_cdeg_sejour_et_cuisine
     remote_temperature_timeout: 60min
     update_interval: 3500ms # shouldn't be less than 1 second
     debounce_delay: 100ms # delay to prevent bouncing
+    connection_bootstrap_delay: 24s # delay to wait for the ESP32 to boot up and stabilize the WiFi connection
     hp_uptime_connection_sensor:
       name: ${name} HP Uptime Connection
       update_interval: 30s
